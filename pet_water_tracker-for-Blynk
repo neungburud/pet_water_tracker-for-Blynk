@@ -1,0 +1,512 @@
+#define BLYNK_TEMPLATE_ID "TMPL6NoF0TqpZ"
+#define BLYNK_TEMPLATE_NAME "PetWaterTracker"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <TimeLib.h>
+
+// ค่าคงที่สำหรับการตัดสินใจ
+#define RSSI_THRESHOLD -60       // ค่าความแรงของสัญญาณที่บ่งชี้ว่าอยู่ใกล้
+#define MIN_DRINKING_TIME 3.0    // เวลาขั้นต่ำในการดื่ม (วินาที)
+#define MOVEMENT_THRESHOLD 5     // ค่า threshold สำหรับตรวจจับการเคลื่อนไหว
+#define MAX_HISTORY_RECORDS 100  // จำนวนรายการประวัติสูงสุดที่เก็บ
+#define RECONNECT_INTERVAL 30000 // ระยะเวลาในการพยายามเชื่อมต่อใหม่ (ms)
+
+// ตั้งค่า Wi-Fi
+const char* ssid = "edimax_2.4G";
+const char* password = "0645064615"; 
+const char* auth = "cKT_nZGxgiEljvBknay0OlpHqyu2Yv4n";
+
+// ตั้งค่า BLE
+BLEScan* pBLEScan;
+
+// ชื่อสัตว์เลี้ยง
+const char* pet1Name = "กะเพรา";  // ชื่อสำหรับ Pet1
+const char* pet2Name = "ลัคกี้";  // ชื่อสำหรับ Pet2
+
+// ข้อมูล Beacon ของสัตว์เลี้ยงตัวที่ 1
+const char* targetNamePet1 = "R24030513";
+const char* targetMACPet1 = "51:00:24:03:02:01";
+int rssiBufferPet1[10] = {-100, -100, -100, -100, -100, -100, -100, -100, -100, -100};
+bool pet1Nearby = false;
+unsigned long startTimePet1 = 0;
+bool dataSentPet1 = false;
+int drinkingCountPet1 = 0;
+
+// ข้อมูล Beacon ของสัตว์เลี้ยงตัวที่ 2
+const char* targetNamePet2 = "Petkit_P3C";
+const char* targetMACPet2 = "A4:C1:38:6A:8F:DB";
+int rssiBufferPet2[10] = {-100, -100, -100, -100, -100, -100, -100, -100, -100, -100};
+bool pet2Nearby = false;
+unsigned long startTimePet2 = 0;
+bool dataSentPet2 = false;
+int drinkingCountPet2 = 0;
+
+// ตัวแปรสำหรับการเชื่อมต่อและการจัดการ
+unsigned long lastResetTime = 0;           // เวลาที่รีเซ็ตตัวนับล่าสุด
+unsigned long lastReconnectAttempt = 0;    // เวลาพยายามเชื่อมต่อล่าสุด
+unsigned long lastHeartbeatTime = 0;       // เวลาส่ง heartbeat ล่าสุด
+bool wifiConnected = false;                // สถานะการเชื่อมต่อ WiFi
+bool blynkConnected = false;               // สถานะการเชื่อมต่อ Blynk
+
+// ตัวแปรสำหรับการลดการใช้พลังงาน
+const int SCAN_INTERVAL = 1000;           // ระยะเวลาระหว่างการสแกน (ms)
+unsigned long lastScanTime = 0;           // เวลาสแกนล่าสุด
+
+// โครงสร้างข้อมูลสำหรับประวัติการดื่มน้ำ
+struct DrinkingRecord {
+  String petName;
+  float duration;
+  time_t timestamp;
+};
+
+// อาร์เรย์สำหรับเก็บประวัติการดื่มน้ำ
+DrinkingRecord drinkingHistory[MAX_HISTORY_RECORDS];
+int historyIndex = 0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // เริ่มต้น SPIFFS สำหรับเก็บข้อมูล
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS initialization failed!");
+  } else {
+    Serial.println("SPIFFS initialized successfully");
+    loadHistoryFromSPIFFS();
+  }
+  
+  // เชื่อมต่อ WiFi
+  connectWiFi();
+  
+  // เชื่อมต่อกับ Blynk
+  connectBlynk();
+  
+  // ตั้งค่า BLE
+  setupBLE();
+  
+  // ตั้งเวลาเริ่มต้น (เวลาปัจจุบัน)
+  setTime(12, 0, 0, 15, 6, 2024); // ตั้งเวลาเริ่มต้น (ชั่วโมง, นาที, วินาที, วัน, เดือน, ปี)
+  
+  Serial.println("Setup completed");
+}
+
+void loop() {
+  // ตรวจสอบและจัดการการเชื่อมต่อ
+  checkConnections();
+  
+  // รัน Blynk หากเชื่อมต่อ
+  if (blynkConnected) {
+    Blynk.run();
+  }
+  
+  // รีเซ็ตตัวนับการดื่มน้ำทุกวัน
+  resetDrinkingCount();
+  
+  // ทำการสแกนตามช่วงเวลาที่กำหนดเพื่อลดการใช้พลังงาน
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastScanTime >= SCAN_INTERVAL) {
+    lastScanTime = currentMillis;
+    performBLEScan();
+  }
+  
+  // ส่ง heartbeat ไปยัง Blynk ทุก 5 นาที
+  if (currentMillis - lastHeartbeatTime >= 300000) {
+    lastHeartbeatTime = currentMillis;
+    if (blynkConnected) {
+      Blynk.virtualWrite(V10, "heartbeat");
+      Serial.println("Heartbeat sent to Blynk");
+    }
+  }
+}
+
+// ฟังก์ชันทำการสแกน BLE
+void performBLEScan() {
+  if (!wifiConnected) return; // ไม่สแกนหากไม่ได้เชื่อมต่อ WiFi เพื่อประหยัดพลังงาน
+  
+  BLEScanResults* foundDevices = pBLEScan->start(1, false);
+  int strongestRSSI = -100;
+  String strongestPet = "";
+  bool foundPet1 = false;
+  bool foundPet2 = false;
+
+  for (int i = 0; i < foundDevices->getCount(); i++) {
+    BLEAdvertisedDevice device = foundDevices->getDevice(i);
+    
+    // ตรวจจับและประมวลผลข้อมูลสำหรับ Pet1
+    detectPetDrinking(device, targetNamePet1, targetMACPet1, 
+                      rssiBufferPet1, pet1Nearby, startTimePet1, 
+                      dataSentPet1, drinkingCountPet1, pet1Name, 
+                      V1, V2, V3, "pet1_drinking", foundPet1, strongestRSSI, strongestPet);
+    
+    // ตรวจจับและประมวลผลข้อมูลสำหรับ Pet2
+    detectPetDrinking(device, targetNamePet2, targetMACPet2, 
+                      rssiBufferPet2, pet2Nearby, startTimePet2, 
+                      dataSentPet2, drinkingCountPet2, pet2Name, 
+                      V4, V5, V6, "pet2_drinking", foundPet2, strongestRSSI, strongestPet);
+  }
+
+  // แสดงผลสรุปการสแกน
+  Serial.print("Scan Summary: Pet1=" + String(foundPet1 ? "Found" : "Not Found"));
+  Serial.println(" | Pet2=" + String(foundPet2 ? "Found" : "Not Found"));
+  if (strongestPet != "") {
+    Serial.println("Strongest Signal: " + strongestPet + " | RSSI: " + String(strongestRSSI));
+  } else if (!foundPet1 && !foundPet2) {
+    Serial.println("No target Beacons found.");
+  }
+
+  pBLEScan->clearResults();
+}
+
+// ฟังก์ชันตรวจจับและประมวลผลข้อมูลการดื่มน้ำของสัตว์เลี้ยง
+void detectPetDrinking(BLEAdvertisedDevice device, const char* targetName, const char* targetMAC, 
+                      int* rssiBuffer, bool& petNearby, unsigned long& startTime, 
+                      bool& dataSent, int& drinkingCount, const char* petName, 
+                      int pinDuration, int pinName, int pinCount, const char* eventName,
+                      bool& foundPet, int& strongestRSSI, String& strongestPet) {
+  
+  String devName = device.getName().length() > 0 ? device.getName().c_str() : "No Name";
+  String devMAC = device.getAddress().toString().c_str();
+  int rssi = device.getRSSI();
+  
+  if ((!devName.isEmpty() && devName == targetName) || devMAC == targetMAC) {
+    foundPet = true;
+    updateRSSIBuffer(rssiBuffer, rssi);
+    int avgRSSI = getAverageRSSI(rssiBuffer);
+    Serial.print(String(petName) + " Found | Avg RSSI: ");
+    Serial.println(avgRSSI);
+    
+    // เพิ่มการตรวจสอบการเคลื่อนไหวเพื่อแยกแยะการเดินผ่านกับการดื่มน้ำ
+    bool isMoving = detectMovement(rssiBuffer);
+    
+    if (avgRSSI > RSSI_THRESHOLD && !isMoving) {
+      if (!petNearby) {
+        startTime = millis();
+        petNearby = true;
+        dataSent = false;
+        Serial.println(String(petName) + " Nearby Started!");
+        if (blynkConnected) {
+          Blynk.logEvent(eventName, String(petName) + "มาดื่มน้ำ!");
+        }
+      }
+      
+      // แสดงระยะเวลาที่ผ่านไป
+      Serial.println(String(petName) + " Nearby | Duration so far: " + 
+                    String((millis() - startTime) / 1000.0) + " sec");
+      
+      // ปรับปรุงค่า strongest signal
+      if (avgRSSI > strongestRSSI) {
+        strongestRSSI = avgRSSI;
+        strongestPet = petName;
+      }
+      
+      // บันทึกข้อมูลเพิ่มเติมสำหรับการวิเคราะห์
+      logDrinkingData(petName, avgRSSI, (millis() - startTime) / 1000.0);
+      
+    } else if (petNearby && !dataSent) {
+      unsigned long duration = millis() - startTime;
+      float durationInSeconds = duration / 1000.0;
+      
+      // เพิ่มเงื่อนไขเวลาขั้นต่ำเพื่อกรองการเดินผ่าน
+      if (durationInSeconds > MIN_DRINKING_TIME) {
+        sendToBlynk(petName, durationInSeconds, drinkingCount, pinDuration, pinName, pinCount);
+        
+        // บันทึกข้อมูลลงในประวัติ
+        saveHistoryData(petName, durationInSeconds);
+        
+        Serial.println(String(petName) + " Left after drinking!");
+      } else {
+        Serial.println(String(petName) + " Just passed by (duration < minimum)");
+      }
+      
+      petNearby = false;
+      dataSent = true;
+    }
+  }
+}
+
+// ฟังก์ชันตรวจสอบการเคลื่อนไหว
+bool detectMovement(int* rssiBuffer) {
+  int variation = 0;
+  for (int i = 1; i < 10; i++) {
+    variation += abs(rssiBuffer[i] - rssiBuffer[i-1]);
+  }
+  return (variation / 9) > MOVEMENT_THRESHOLD;
+}
+
+// ฟังก์ชันบันทึกข้อมูลการดื่มน้ำสำหรับการวิเคราะห์
+void logDrinkingData(const char* petName, int avgRSSI, float duration) {
+  // สามารถเพิ่มการบันทึกลงไฟล์หรือหน่วยความจำหากต้องการ
+  // ข้อมูลนี้สามารถใช้สำหรับการวิเคราะห์เชิงลึกในอนาคต
+}
+
+// ฟังก์ชันตั้งค่า BLE
+void setupBLE() {
+  BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+  Serial.println("BLE initialized");
+}
+
+// ฟังก์ชันอัพเดต RSSI Buffer
+void updateRSSIBuffer(int* buffer, int newRSSI) {
+  for (int i = 9; i > 0; i--) {
+    buffer[i] = buffer[i - 1];
+  }
+  buffer[0] = newRSSI;
+}
+
+// ฟังก์ชันคำนวณค่าเฉลี่ย RSSI
+int getAverageRSSI(int* buffer) {
+  int sum = 0;
+  for (int i = 0; i < 10; i++) {
+    sum += buffer[i];
+  }
+  return sum / 10;
+}
+
+// ฟังก์ชันส่งข้อมูลไปยัง Blynk
+void sendToBlynk(const char* petName, float duration, int& drinkingCount, int pinDuration, int pinName, int pinCount) {
+  if (blynkConnected) {
+    Blynk.virtualWrite(pinDuration, duration);  // ส่งระยะเวลา
+    Blynk.virtualWrite(pinName, petName);       // ส่งชื่อจริงของสัตว์เลี้ยง
+    drinkingCount++;                            // เพิ่มจำนวนครั้ง
+    Blynk.virtualWrite(pinCount, drinkingCount); // ส่งจำนวนครั้ง
+
+    // ส่งข้อมูลสรุปรายวันไปยัง Blynk
+    updateDailySummary();
+
+    Serial.println("Data sent to Blynk:");
+    Serial.println(String("Pet Name: ") + petName);
+    Serial.println("Duration: " + String(duration) + " seconds");
+    Serial.println("Drinking Count: " + String(drinkingCount));
+  } else {
+    Serial.println("Blynk not connected. Data not sent.");
+    
+    // เก็บข้อมูลชั่วคราวไว้ในกรณีที่ Blynk ไม่ได้เชื่อมต่อ
+    // สามารถเพิ่มโค้ดที่นี่เพื่อเก็บลงใน SPIFFS
+  }
+}
+
+// ฟังก์ชันอัปเดตข้อมูลสรุปรายวัน
+void updateDailySummary() {
+  if (blynkConnected) {
+    // สรุปข้อมูลสำหรับสัตว์เลี้ยงทั้งสองตัว
+    Blynk.virtualWrite(V7, drinkingCountPet1);  // จำนวนครั้งของ Pet1
+    Blynk.virtualWrite(V8, drinkingCountPet2);  // จำนวนครั้งของ Pet2
+    
+    // คำนวณเวลาเฉลี่ยจากประวัติ (สามารถเพิ่มเติมได้)
+  }
+}
+
+// ฟังก์ชันรีเซ็ตตัวนับทุกวัน
+void resetDrinkingCount() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastResetTime >= 86400000) { // 86400000ms = 24 ชั่วโมง
+    drinkingCountPet1 = 0;
+    drinkingCountPet2 = 0;
+    lastResetTime = currentTime;
+    
+    // รีเซ็ตค่าใน Blynk
+    if (blynkConnected) {
+      Blynk.virtualWrite(V3, 0);
+      Blynk.virtualWrite(V6, 0);
+      Blynk.virtualWrite(V7, 0);
+      Blynk.virtualWrite(V8, 0);
+    }
+    
+    Serial.println("Drinking counts reset!");
+  }
+}
+
+// ฟังก์ชันบันทึกข้อมูลประวัติการดื่มน้ำ
+void saveHistoryData(const char* petName, float duration) {
+  // เพิ่มรายการใหม่ไปยังประวัติ
+  drinkingHistory[historyIndex].petName = String(petName);
+  drinkingHistory[historyIndex].duration = duration;
+  drinkingHistory[historyIndex].timestamp = now(); // เวลาปัจจุบัน
+  
+  // เพิ่ม index และรีเซ็ตหากเกินขอบเขต
+  historyIndex = (historyIndex + 1) % MAX_HISTORY_RECORDS;
+  
+  // บันทึกลงใน SPIFFS เป็นระยะ
+  if (historyIndex % 5 == 0) { // บันทึกทุก 5 รายการ
+    saveHistoryToSPIFFS();
+  }
+}
+
+// ฟังก์ชันบันทึกประวัติลงใน SPIFFS
+void saveHistoryToSPIFFS() {
+  DynamicJsonDocument doc(16384); // ขนาดใหญ่พอที่จะเก็บประวัติทั้งหมด
+  JsonArray array = doc.to<JsonArray>();
+  
+  for (int i = 0; i < MAX_HISTORY_RECORDS; i++) {
+    if (drinkingHistory[i].timestamp > 0) { // ถ้าเป็นรายการที่มีข้อมูล
+      JsonObject obj = array.createNestedObject();
+      obj["petName"] = drinkingHistory[i].petName;
+      obj["duration"] = drinkingHistory[i].duration;
+      obj["timestamp"] = drinkingHistory[i].timestamp;
+    }
+  }
+  
+  File file = SPIFFS.open("/history.json", "w");
+  if (!file) {
+    Serial.println("Failed to open history file for writing");
+    return;
+  }
+  
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Failed to write history to file");
+  } else {
+    Serial.println("History saved to SPIFFS");
+  }
+  
+  file.close();
+}
+
+// ฟังก์ชันโหลดประวัติจาก SPIFFS
+void loadHistoryFromSPIFFS() {
+  if (!SPIFFS.exists("/history.json")) {
+    Serial.println("History file not found");
+    return;
+  }
+  
+  File file = SPIFFS.open("/history.json", "r");
+  if (!file) {
+    Serial.println("Failed to open history file for reading");
+    return;
+  }
+  
+  DynamicJsonDocument doc(16384);
+  DeserializationError error = deserializeJson(doc, file);
+  
+  if (error) {
+    Serial.println("Failed to parse history file");
+    file.close();
+    return;
+  }
+  
+  JsonArray array = doc.as<JsonArray>();
+  historyIndex = 0;
+  
+  for (JsonObject obj : array) {
+    drinkingHistory[historyIndex].petName = obj["petName"].as<String>();
+    drinkingHistory[historyIndex].duration = obj["duration"].as<float>();
+    drinkingHistory[historyIndex].timestamp = obj["timestamp"].as<time_t>();
+    
+    historyIndex = (historyIndex + 1) % MAX_HISTORY_RECORDS;
+  }
+  
+  Serial.println("History loaded from SPIFFS");
+  file.close();
+}
+
+// ฟังก์ชันเชื่อมต่อ WiFi
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    return;
+  }
+  
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected");
+    wifiConnected = true;
+  } else {
+    Serial.println("\nWiFi Connection Failed");
+    wifiConnected = false;
+  }
+}
+
+// ฟังก์ชันเชื่อมต่อ Blynk
+void connectBlynk() {
+  if (!wifiConnected) return;
+  
+  Serial.print("Connecting to Blynk...");
+  Blynk.config(auth);
+  
+  int attempts = 0;
+  while (!Blynk.connected() && attempts < 10) {
+    Blynk.connect(3000); // พยายามเชื่อมต่อด้วย timeout 3 วินาที
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (Blynk.connected()) {
+    Serial.println("\nBlynk Connected");
+    blynkConnected = true;
+    
+    // ส่งข้อมูลเริ่มต้นไปยัง Blynk
+    Blynk.virtualWrite(V2, pet1Name);
+    Blynk.virtualWrite(V5, pet2Name);
+    updateDailySummary();
+  } else {
+    Serial.println("\nBlynk Connection Failed");
+    blynkConnected = false;
+  }
+}
+
+// ฟังก์ชันตรวจสอบและจัดการการเชื่อมต่อ
+void checkConnections() {
+  unsigned long currentMillis = millis();
+  
+  // ตรวจสอบการเชื่อมต่อทุก 30 วินาที
+  if (currentMillis - lastReconnectAttempt >= RECONNECT_INTERVAL) {
+    lastReconnectAttempt = currentMillis;
+    
+    // ตรวจสอบ WiFi
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected. Reconnecting...");
+      wifiConnected = false;
+      blynkConnected = false; // Blynk ต้องขาดการเชื่อมต่อหาก WiFi ขาดการเชื่อมต่อ
+      connectWiFi();
+    } else {
+      wifiConnected = true;
+    }
+    
+    // ตรวจสอบ Blynk หาก WiFi เชื่อมต่อ
+    if (wifiConnected && !Blynk.connected()) {
+      Serial.println("Blynk disconnected. Reconnecting...");
+      blynkConnected = false;
+      connectBlynk();
+    } else if (wifiConnected) {
+      blynkConnected = Blynk.connected();
+    }
+  }
+}
+
+// ฟังก์ชัน Blynk สำหรับรับค่าจากแอปพลิเคชัน (หากมี)
+BLYNK_WRITE(V20) {
+  // ตัวอย่างการรับค่าจาก slider ใน Blynk
+  int value = param.asInt();
+  // ทำอะไรบางอย่างกับค่าที่ได้รับ
+  Serial.println("Received from Blynk V20: " + String(value));
+}
+
+// ฟังก์ชันแสดงสถานะการเชื่อมต่อไปยัง Blynk
+BLYNK_CONNECTED() {
+  Serial.println("Blynk connected event");
+  blynkConnected = true;
+  
+  // ซิงค์ข้อมูลกับ Blynk เมื่อเชื่อมต่อใหม่
+  Blynk.virtualWrite(V2, pet1Name);
+  Blynk.virtualWrite(V5, pet2Name);
+  Blynk.virtualWrite(V3, drinkingCountPet1);
+  Blynk.virtualWrite(V6, drinkingCountPet2);
+  updateDailySummary();
+}
