@@ -1,0 +1,549 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <Preferences.h> // สำหรับ NVS
+#include <time.h>        // สำหรับการจัดการเวลา
+
+// --- ตั้งค่า Wi-Fi ---
+const char* ssid = "YOUR_WIFI_SSID"; // << แก้ไขเป็นชื่อ Wi-Fi ของคุณ
+const char* password = "YOUR_WIFI_PASSWORD"; // << แก้ไขเป็นรหัสผ่าน Wi-Fi ของคุณ
+
+// --- ตั้งค่า MQTT ---
+const char* mqtt_server = "h970e2d4.ala.asia-southeast1.emqxsl.com"; // หรือ Broker ของคุณ
+const int mqtt_port = 8883;
+const char* mqtt_username = "neungburud"; // Username MQTT ของคุณ
+const char* mqtt_password = "@Top140635";  // Password MQTT ของคุณ
+
+// --- หัวข้อ MQTT ---
+const char* topic_device_status = "pet/device/status";
+const char* topic_pet_drinking = "pet/drinking";
+const char* topic_device_config_set = "pet/device/config/set";    // ESP32 รับค่า settings จาก topic นี้
+const char* topic_device_config_report = "pet/device/config/report"; // ESP32 ส่งค่า settings ปัจจุบันไป topic นี้
+
+// --- ตัวแปร Settings (สามารถเปลี่ยนแปลงได้จาก MQTT และบันทึกลง NVS) ---
+int RSSI_NEAR_THRESHOLD = -75;
+int RSSI_FAR_THRESHOLD = -85;
+int MIN_DRINKING_TIME = 1000; // ms, เวลาขั้นต่ำที่ต้องอยู่ใกล้ก่อนเริ่มนับดื่ม
+float RSSI_FILTER = 0.7f;
+int MIN_VALID_DRINKING_TIME = 2000; // ms, เวลาขั้นต่ำที่ดื่มจริงจึงจะนับว่าดื่มเสร็จ
+int statusInterval = 30000; // ms, ความถี่ในการส่ง Device Status
+int scanInterval = 5000;    // ms, ความถี่ในการสแกน BLE
+
+// --- ค่าคงที่สำหรับการทำงาน ---
+const int bleScanDuration = 1;    // วินาที, ระยะเวลาในการสแกน BLE แต่ละครั้ง
+
+// --- ตัวแปร Global อื่นๆ ---
+unsigned long lastStatusTime = 0;
+unsigned long lastScanTime = 0;
+unsigned long lastMemCheck = 0;
+const int memCheckInterval = 60000;     // ms, ความถี่ในการตรวจสอบหน่วยความจำ
+
+unsigned long lastReconnectAttempt = 0;
+const int reconnectInterval = 5000;     // ms
+int failCount = 0;
+const int maxFailCount = 10;
+bool wasConnected = false;
+unsigned long disconnectTime = 0;
+const unsigned long maxDisconnectTime = 300000; // 5 นาที
+
+const bool testMode = false;
+const bool debugMode = true;
+
+// --- Clients และ Objects ---
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+BLEScan* pBLEScan = nullptr;
+Preferences preferences; // Object สำหรับ NVS
+
+// --- สถานะระบบ ---
+enum SystemState { INITIALIZING, WIFI_CONNECTING, MQTT_CONNECTING, RUNNING, ERROR };
+SystemState currentState = INITIALIZING;
+String deviceId;
+
+// --- ข้อมูลสัตว์เลี้ยง ---
+const char* pet1Name = "กะเพรา";
+const char* pet2Name = "ลัคกี้";
+const char* pet3Name = "งับบี้";
+
+// MAC Address ของ Beacon (ควรเป็นตัวพิมพ์เล็กทั้งหมด)
+const char* targetMACPet1_str = "51:00:24:03:02:01"; // *** แก้เป็น MAC จริง ***
+const char* targetMACPet2_str = "a4:c1:38:6a:8f:db"; // *** แก้เป็น MAC จริง ***
+const char* targetMACPet3_str = "51:00:24:12:00:c8"; // *** MAC ของงับบี้ ***
+
+BLEAddress targetMACPet1(targetMACPet1_str);
+BLEAddress targetMACPet2(targetMACPet2_str);
+BLEAddress targetMACPet3(targetMACPet3_str);
+
+// ตัวแปร BLE เฉพาะกิจ
+int currentRSSIPet1 = -100, currentRSSIPet2 = -100, currentRSSIPet3 = -100;
+bool pet1FoundInScan = false, pet2FoundInScan = false, pet3FoundInScan = false;
+
+// RSSI ที่ผ่านการกรอง
+int lastRSSIPet1 = -100, lastRSSIPet2 = -100, lastRSSIPet3 = -100;
+
+// ตัวแปรติดตามสถานะการดื่มน้ำ
+bool pet1Near = false, pet2Near = false, pet3Near = false;
+unsigned long pet1NearStartTime = 0, pet2NearStartTime = 0, pet3NearStartTime = 0;
+bool pet1Drinking = false, pet2Drinking = false, pet3Drinking = false;
+int pet1DrinkCount = 0, pet2DrinkCount = 0, pet3DrinkCount = 0;
+unsigned long pet1DrinkStartTime = 0, pet2DrinkStartTime = 0, pet3DrinkStartTime = 0;
+bool pet1DataSent = false, pet2DataSent = false, pet3DataSent = false; // Sent "start_drinking"
+bool pet1FinishDataSent = false, pet2FinishDataSent = false, pet3FinishDataSent = false; // Sent "finish_drinking"
+int pet1StableCount = 0, pet2StableCount = 0, pet3StableCount = 0;
+const int STABLE_THRESHOLD = 2;
+
+// ตัวแปรสำหรับเก็บเวลาดื่มน้ำล่าสุด (Unix Timestamp)
+unsigned long pet1LastDrinkTimestamp = 0;
+unsigned long pet2LastDrinkTimestamp = 0;
+unsigned long pet3LastDrinkTimestamp = 0;
+
+
+// --- ประกาศ Prototype ของฟังก์ชัน ---
+void loadConfigFromNVS();
+void saveConfigToNVS();
+void publishCurrentConfig();
+unsigned long getUnixTimestamp();
+void setupNTP();
+void checkHeapMemory();
+void simulateBLEData();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void connectWiFi();
+void setupMQTT();
+bool connectMQTT();
+void setupBLE();
+void runMainLoop();
+void scanBLEDevices();
+void processScanResults();
+void checkPetStatus(unsigned long currentTime, int petNum, const char* petName,
+                   BLEAddress targetMAC, int& currentRSSIValue, bool& petFoundInScan,
+                   int& lastRSSI, bool& petNear, unsigned long& petNearStartTime,
+                   bool& petDrinking, unsigned long& petDrinkStartTime, int& petDrinkCount,
+                   bool& petDataSent, bool& petFinishDataSent, int& petStableCount,
+                   unsigned long& petLastDrinkTimestamp);
+void sendStatusUpdate();
+void handleError();
+
+
+// --- ฟังก์ชันสำหรับ NVS ---
+void loadConfigFromNVS() {
+    preferences.begin("petcfg", true); // "petcfg" คือ namespace, true = read-only
+    RSSI_NEAR_THRESHOLD = preferences.getInt("rssi_near", RSSI_NEAR_THRESHOLD);
+    RSSI_FAR_THRESHOLD = preferences.getInt("rssi_far", RSSI_FAR_THRESHOLD);
+    MIN_DRINKING_TIME = preferences.getInt("min_drink", MIN_DRINKING_TIME);
+    RSSI_FILTER = preferences.getFloat("rssi_filt", RSSI_FILTER);
+    MIN_VALID_DRINKING_TIME = preferences.getInt("min_valid", MIN_VALID_DRINKING_TIME);
+    statusInterval = preferences.getInt("stat_int", statusInterval);
+    scanInterval = preferences.getInt("scan_int", scanInterval);
+    preferences.end();
+    if (debugMode) Serial.println("Loaded configuration from NVS (if exists).");
+}
+
+void saveConfigToNVS() {
+    preferences.begin("petcfg", false); // false = read-write
+    preferences.putInt("rssi_near", RSSI_NEAR_THRESHOLD);
+    preferences.putInt("rssi_far", RSSI_FAR_THRESHOLD);
+    preferences.putInt("min_drink", MIN_DRINKING_TIME);
+    preferences.putFloat("rssi_filt", RSSI_FILTER);
+    preferences.putInt("min_valid", MIN_VALID_DRINKING_TIME);
+    preferences.putInt("stat_int", statusInterval);
+    preferences.putInt("scan_int", scanInterval);
+    preferences.end();
+    if (debugMode) Serial.println("Saved new configuration to NVS.");
+}
+
+// --- ฟังก์ชันสำหรับ NTP และ Unix Timestamp ---
+unsigned long getUnixTimestamp() {
+    time_t now;
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 500)) { // เพิ่ม timeout 500ms
+        now = mktime(&timeinfo);
+        return now;
+    }
+    return 0; // คืนค่า 0 ถ้าดึงเวลาไม่ได้
+}
+
+void setupNTP() {
+    const char* ntpServer1 = "pool.ntp.org";
+    const char* ntpServer2 = "time.google.com"; // Server สำรอง
+    const long gmtOffset_sec = 7 * 3600; // Bangkok +7 hours (Asia/Bangkok)
+    const int daylightOffset_sec = 0;     // Thailand ไม่มี Daylight Saving
+
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+    if (debugMode) Serial.println("Configured NTP time. Waiting for sync...");
+
+    unsigned long startTime = millis();
+    struct tm timeinfo;
+    while (!getLocalTime(&timeinfo, 1000) || timeinfo.tm_year < (2023 - 1900)) { // ปีจะเริ่มจาก 1900
+        if (millis() - startTime > 15000) { // Timeout 15 วินาที
+            if (debugMode) Serial.println("\nNTP Time sync failed or timed out. Timestamps may be incorrect.");
+            return;
+        }
+        delay(500);
+        if (debugMode) Serial.print(".");
+    }
+    if (debugMode) {
+        Serial.println("\nNTP Time synced successfully.");
+        char timeStr[30];
+        strftime(timeStr, sizeof(timeStr), "%A, %B %d %Y %H:%M:%S", &timeinfo); // รูปแบบวันที่เวลา
+        Serial.printf("Current time: %s\n", timeStr);
+    }
+}
+
+
+// --- ฟังก์ชัน MQTT callback ---
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    char tempPayload[length + 1];
+    memcpy(tempPayload, payload, length);
+    tempPayload[length] = '\0';
+
+    if (debugMode) {
+        Serial.print("Message arrived ["); Serial.print(topic); Serial.print("]: ");
+        Serial.println(tempPayload);
+    }
+
+    if (strcmp(topic, topic_device_config_set) == 0) {
+        if (debugMode) Serial.println("Received new config settings via MQTT.");
+        DynamicJsonDocument doc(512);
+        DeserializationError error = deserializeJson(doc, tempPayload);
+
+        if (error) {
+            Serial.print(F("deserializeJson() for config failed: "));
+            Serial.println(error.f_str());
+            return;
+        }
+
+        bool configChanged = false;
+        if (doc.containsKey("rssi_near")) { int val = doc["rssi_near"]; if (val >= -100 && val <= 0 && val != RSSI_NEAR_THRESHOLD) { RSSI_NEAR_THRESHOLD = val; configChanged = true; } }
+        if (doc.containsKey("rssi_far")) { int val = doc["rssi_far"]; if (val >= -100 && val <= 0 && val != RSSI_FAR_THRESHOLD) { RSSI_FAR_THRESHOLD = val; configChanged = true; } }
+        if (doc.containsKey("status_interval")) { int val = doc["status_interval"]; if (val >= 5000 && val != statusInterval) { statusInterval = val; configChanged = true; } }
+        if (doc.containsKey("scan_interval")) { int val = doc["scan_interval"]; if (val >= 1000 && val != scanInterval) { scanInterval = val; configChanged = true; } }
+        if (doc.containsKey("min_valid_drinking_time")) { int val = doc["min_valid_drinking_time"]; if (val >= 500 && val != MIN_VALID_DRINKING_TIME) { MIN_VALID_DRINKING_TIME = val; configChanged = true; } }
+        if (doc.containsKey("min_drinking_time")) { int val = doc["min_drinking_time"]; if (val >= 500 && val != MIN_DRINKING_TIME) { MIN_DRINKING_TIME = val; configChanged = true; } }
+        if (doc.containsKey("rssi_filter")) { float val = doc["rssi_filter"].as<float>(); if (val >= 0.0f && val <= 1.0f && abs(val - RSSI_FILTER) > 0.001f) { RSSI_FILTER = val; configChanged = true; } }
+
+        if (configChanged) {
+            if (debugMode) {
+                Serial.println("Configuration updated from MQTT. New values:");
+                Serial.printf("  RSSI_NEAR: %d, RSSI_FAR: %d, StatusInt: %d, ScanInt: %d\n", RSSI_NEAR_THRESHOLD, RSSI_FAR_THRESHOLD, statusInterval, scanInterval);
+                Serial.printf("  MinValidDrink: %d, MinDrink: %d, RSSIFilter: %.2f\n", MIN_VALID_DRINKING_TIME, MIN_DRINKING_TIME, RSSI_FILTER);
+            }
+            saveConfigToNVS();
+            publishCurrentConfig();
+        } else {
+            if (debugMode) Serial.println("No valid configuration values were changed from MQTT message.");
+        }
+    }
+}
+
+
+// --- Setup ---
+void setup() {
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("\n=== ESP32 Pet Drinking Tracker v4.4 - NVS & Last Drink Time (Corrected Globals) ===");
+
+    loadConfigFromNVS(); // โหลด Config จาก NVS ก่อน
+
+    uint64_t chipid = ESP.getEfuseMac();
+    deviceId = "ESP32-" + String((uint16_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX);
+    Serial.print("Device ID: "); Serial.println(deviceId);
+    checkHeapMemory();
+
+    if (debugMode) {
+        Serial.println("------ Initial Configuration (after NVS load) ------");
+        Serial.printf("RSSI_NEAR_THRESHOLD: %d dBm\n", RSSI_NEAR_THRESHOLD);
+        Serial.printf("RSSI_FAR_THRESHOLD: %d dBm\n", RSSI_FAR_THRESHOLD);
+        Serial.printf("MIN_DRINKING_TIME: %d ms\n", MIN_DRINKING_TIME);
+        Serial.printf("MIN_VALID_DRINKING_TIME: %d ms\n", MIN_VALID_DRINKING_TIME);
+        Serial.printf("STABLE_THRESHOLD: %d counts\n", STABLE_THRESHOLD);
+        Serial.printf("RSSI_FILTER: %.2f\n", RSSI_FILTER);
+        Serial.printf("statusInterval: %d ms\n", statusInterval);
+        Serial.printf("scanInterval: %d ms\n", scanInterval);
+        Serial.println("----------------------------------------------------");
+    }
+
+    if (testMode) {
+        Serial.println("!!! RUNNING IN TEST MODE - USING SIMULATED BLE DATA !!!");
+        randomSeed(analogRead(A0));
+    }
+    currentState = WIFI_CONNECTING;
+}
+
+// --- Loop ---
+void loop() {
+  unsigned long currentTime = millis();
+  switch (currentState) {
+    case INITIALIZING: currentState = WIFI_CONNECTING; break;
+    case WIFI_CONNECTING: connectWiFi(); break;
+    case MQTT_CONNECTING:
+        if (WiFi.status() == WL_CONNECTED && pBLEScan == nullptr && !testMode) { setupBLE(); }
+        if (WiFi.status() == WL_CONNECTED) { setupMQTT(); connectMQTT(); }
+        else { currentState = WIFI_CONNECTING; } // If WiFi dropped
+        break;
+    case RUNNING: runMainLoop(); break;
+    case ERROR: handleError(); break;
+    default: Serial.println("Unknown state! Reverting to WIFI_CONNECTING."); currentState = WIFI_CONNECTING; break;
+  }
+
+  if (wasConnected && !client.connected() && currentState == RUNNING) {
+    if (disconnectTime == 0) { disconnectTime = currentTime; Serial.println("MQTT disconnected while RUNNING. Monitoring..."); }
+    else if (currentTime - disconnectTime > maxDisconnectTime) { Serial.println("Disconnected from MQTT too long. Restarting..."); ESP.restart(); }
+  } else if (client.connected()) { disconnectTime = 0; }
+}
+
+// --- connectWiFi, setupMQTT, connectMQTT, setupBLE ---
+void connectWiFi() {
+  Serial.print("Connecting to WiFi ("); Serial.print(ssid); Serial.print(")...");
+  WiFi.disconnect(true); delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!"); Serial.print("IP: "); Serial.println(WiFi.localIP());
+    setupNTP();
+    currentState = MQTT_CONNECTING; lastReconnectAttempt = 0;
+  } else { Serial.println("\nWiFi Connection Failed! Will retry..."); delay(reconnectInterval); }
+}
+
+void setupMQTT() {
+  espClient.setInsecure(); espClient.setTimeout(15);
+  client.setServer(mqtt_server, mqtt_port); client.setCallback(mqttCallback);
+  client.setKeepAlive(60); client.setSocketTimeout(30); client.setBufferSize(1024);
+}
+
+bool connectMQTT() {
+  if (client.connected()) { wasConnected = true; failCount = 0; return true; }
+  if (WiFi.status() != WL_CONNECTED) { currentState = WIFI_CONNECTING; return false; }
+  unsigned long now = millis();
+  if (now - lastReconnectAttempt > reconnectInterval || lastReconnectAttempt == 0) {
+    lastReconnectAttempt = now; Serial.print("Attempting MQTT connection...");
+    String clientId = deviceId;
+    if (client.connect(clientId.c_str(), mqtt_username, mqtt_password)) {
+      Serial.println(" MQTT Connected!"); wasConnected = true; failCount = 0;
+      DynamicJsonDocument doc(768);
+      doc["status"] = "online"; doc["device_id"] = deviceId; doc["reconnected"] = (failCount > 0);
+      doc["ip"] = WiFi.localIP().toString(); doc["wifi_rssi"] = WiFi.RSSI();
+      doc["uptime_ms"] = millis(); doc["free_heap"] = ESP.getFreeHeap(); doc["timestamp"] = getUnixTimestamp();
+      JsonObject p1 = doc.createNestedObject("pet1"); p1["name"]=pet1Name; p1["drink_count"]=pet1DrinkCount; p1["last_drink_ts"]=pet1LastDrinkTimestamp;
+      JsonObject p2 = doc.createNestedObject("pet2"); p2["name"]=pet2Name; p2["drink_count"]=pet2DrinkCount; p2["last_drink_ts"]=pet2LastDrinkTimestamp;
+      JsonObject p3 = doc.createNestedObject("pet3"); p3["name"]=pet3Name; p3["drink_count"]=pet3DrinkCount; p3["last_drink_ts"]=pet3LastDrinkTimestamp;
+      char buffer[768]; size_t n = serializeJson(doc, buffer); client.publish(topic_device_status, buffer, n);
+
+      if (client.subscribe(topic_device_config_set)) { if (debugMode) Serial.printf("Subscribed to: %s\n", topic_device_config_set); }
+      else { Serial.printf("Failed to subscribe to: %s\n", topic_device_config_set); }
+      publishCurrentConfig();
+      if (!testMode && pBLEScan == nullptr) { setupBLE(); }
+      currentState = RUNNING; lastStatusTime = millis(); lastScanTime = millis() - scanInterval + 1000;
+      lastMemCheck = millis(); disconnectTime = 0;
+      return true;
+    } else {
+      failCount++; Serial.print(" MQTT failed, rc="); Serial.print(client.state()); Serial.printf(" (attempt %d/%d)\n", failCount, maxFailCount);
+      if (failCount >= maxFailCount) { Serial.println("Too many MQTT attempts. Restarting..."); delay(1000); ESP.restart(); }
+      return false;
+    }
+  }
+  return false;
+}
+
+void setupBLE() {
+  if (pBLEScan != nullptr) return;
+  Serial.println("Initializing BLE Scanner..."); BLEDevice::init("");
+  pBLEScan = BLEDevice::getScan();
+  if (pBLEScan == nullptr) { Serial.println("CRITICAL: Failed to get BLE Scan object."); currentState = ERROR; return; }
+  pBLEScan->setActiveScan(true); pBLEScan->setInterval(100); pBLEScan->setWindow(99);
+  Serial.println("BLE Scanner Initialized.");
+}
+
+// --- runMainLoop, scanBLEDevices, processScanResults ---
+void runMainLoop() {
+  unsigned long currentTime = millis();
+  if (!client.connected()) { wasConnected = false; currentState = MQTT_CONNECTING; lastReconnectAttempt = 0; return; }
+  if (WiFi.status() != WL_CONNECTED) { client.disconnect(); wasConnected = false; currentState = WIFI_CONNECTING; return; }
+  client.loop();
+
+  if (currentTime - lastMemCheck >= memCheckInterval) { checkHeapMemory(); lastMemCheck = currentTime; }
+  if (statusInterval > 0 && (currentTime - lastStatusTime >= (unsigned long)statusInterval)) { sendStatusUpdate(); lastStatusTime = currentTime; }
+  if (scanInterval > 0 && (currentTime - lastScanTime >= (unsigned long)scanInterval)) {
+    if (testMode) { simulateBLEData(); processScanResults(); }
+    else {
+      if (pBLEScan == nullptr) { Serial.println("BLE not ready, attempting setup..."); setupBLE(); if(pBLEScan == nullptr) { lastScanTime = currentTime; return;}}
+      scanBLEDevices(); processScanResults();
+    }
+    lastScanTime = currentTime;
+  }
+}
+
+void scanBLEDevices() {
+  if (pBLEScan == nullptr) { Serial.println("BLE Scan not initialized! Cannot scan."); return; }
+  if (debugMode) Serial.println("Starting BLE scan...");
+  pet1FoundInScan = false; currentRSSIPet1 = -100;
+  pet2FoundInScan = false; currentRSSIPet2 = -100;
+  pet3FoundInScan = false; currentRSSIPet3 = -100;
+  try {
+    BLEScanResults foundDevices = pBLEScan->start(bleScanDuration, false);
+    int deviceCount = foundDevices.getCount();
+    if (debugMode) { Serial.print("Scan finished. Devices found: "); Serial.println(deviceCount); }
+    for (int i = 0; i < deviceCount; i++) {
+      BLEAdvertisedDevice device = foundDevices.getDevice(i);
+      BLEAddress addr = device.getAddress();
+      int rssi = device.getRSSI();
+      if (addr.equals(targetMACPet1)) { currentRSSIPet1 = rssi; pet1FoundInScan = true; }
+      else if (addr.equals(targetMACPet2)) { currentRSSIPet2 = rssi; pet2FoundInScan = true; }
+      else if (addr.equals(targetMACPet3)) { currentRSSIPet3 = rssi; pet3FoundInScan = true; }
+    }
+    pBLEScan->clearResults();
+  } catch (...) { Serial.println("Exception during BLE scan!"); if(pBLEScan) pBLEScan->stop(); pBLEScan = nullptr; currentState = ERROR; }
+}
+
+void processScanResults() {
+  unsigned long currentTime = millis();
+  checkPetStatus(currentTime, 1, pet1Name, targetMACPet1, currentRSSIPet1, pet1FoundInScan, lastRSSIPet1, pet1Near, pet1NearStartTime, pet1Drinking, pet1DrinkStartTime, pet1DrinkCount, pet1DataSent, pet1FinishDataSent, pet1StableCount, pet1LastDrinkTimestamp);
+  checkPetStatus(currentTime, 2, pet2Name, targetMACPet2, currentRSSIPet2, pet2FoundInScan, lastRSSIPet2, pet2Near, pet2NearStartTime, pet2Drinking, pet2DrinkStartTime, pet2DrinkCount, pet2DataSent, pet2FinishDataSent, pet2StableCount, pet2LastDrinkTimestamp);
+  checkPetStatus(currentTime, 3, pet3Name, targetMACPet3, currentRSSIPet3, pet3FoundInScan, lastRSSIPet3, pet3Near, pet3NearStartTime, pet3Drinking, pet3DrinkStartTime, pet3DrinkCount, pet3DataSent, pet3FinishDataSent, pet3StableCount, pet3LastDrinkTimestamp);
+}
+
+
+// --- checkPetStatus ---
+void checkPetStatus(unsigned long currentTime, int petNum, const char* petName,
+                   BLEAddress targetMAC, int& currentRSSIValue, bool& petFoundInScan,
+                   int& lastRSSI, bool& petNear, unsigned long& petNearStartTime,
+                   bool& petDrinking, unsigned long& petDrinkStartTime, int& petDrinkCount,
+                   bool& petDataSent, bool& petFinishDataSent, int& petStableCount,
+                   unsigned long& petLastDrinkTimestamp)
+{
+    if (petFoundInScan) {
+        lastRSSI = (RSSI_FILTER * lastRSSI) + ((1.0f - RSSI_FILTER) * currentRSSIValue);
+    } else {
+        lastRSSI = (RSSI_FILTER * lastRSSI) + ((1.0f - RSSI_FILTER) * -100.0f);
+    }
+    int filteredRSSI = lastRSSI;
+
+    if (debugMode) {
+      Serial.printf("PET %d (%s): RSSI Raw=%d, Filtered=%d, Stable=%d, Near=%s, Drinking=%s\n",
+                    petNum, petName, currentRSSIValue, filteredRSSI, petStableCount,
+                    petNear ? "Y":"N", petDrinking ? "Y":"N");
+    }
+
+    if (filteredRSSI >= RSSI_NEAR_THRESHOLD) {
+        petStableCount++;
+        if (petStableCount >= STABLE_THRESHOLD) {
+            if (!petNear) {
+                petNear = true; petNearStartTime = currentTime; petStableCount = STABLE_THRESHOLD;
+                if (debugMode) Serial.printf("%s IS NEAR (RSSI: %d)\n", petName, filteredRSSI);
+            }
+            if (petNear && !petDrinking && (currentTime - petNearStartTime >= (unsigned long)MIN_DRINKING_TIME)) {
+                petDrinking = true; petDrinkStartTime = currentTime;
+                petDataSent = false; petFinishDataSent = false;
+                if (!petDataSent) {
+                    DynamicJsonDocument doc(256);
+                    doc["pet"] = petNum; doc["name"] = petName; doc["action"] = "start_drinking";
+                    doc["rssi"] = filteredRSSI; doc["timestamp"] = getUnixTimestamp();
+                    char buffer[256]; size_t n = serializeJson(doc, buffer);
+                    if (client.publish(topic_pet_drinking, buffer, n)) { if (debugMode) Serial.printf("%s START DRINKING. MQTT sent.\n", petName); petDataSent = true; }
+                    else { Serial.printf("FAIL to send START DRINKING for %s\n", petName); }
+                }
+            }
+        }
+    }
+    else if (filteredRSSI <= RSSI_FAR_THRESHOLD) {
+        petStableCount = 0;
+        if (petNear) {
+            petNear = false; if (debugMode) Serial.printf("%s IS NOW FAR (RSSI: %d)\n", petName, filteredRSSI);
+            if (petDrinking) {
+                if (currentTime - petDrinkStartTime >= (unsigned long)MIN_VALID_DRINKING_TIME) {
+                    if (petDataSent && !petFinishDataSent) {
+                        unsigned long drinkDuration = (currentTime - petDrinkStartTime) / 1000;
+                        petDrinkCount++; petLastDrinkTimestamp = getUnixTimestamp();
+                        DynamicJsonDocument doc(384);
+                        doc["pet"] = petNum; doc["name"] = petName; doc["action"] = "finish_drinking";
+                        doc["duration"] = drinkDuration; doc["count"] = petDrinkCount;
+                        doc["rssi"] = filteredRSSI; doc["timestamp"] = petLastDrinkTimestamp;
+                        char buffer[384]; size_t n = serializeJson(doc, buffer);
+                        if (client.publish(topic_pet_drinking, buffer, n)) { if (debugMode) Serial.printf("%s FINISHED DRINKING (Far). Dur: %lus, Count: %d. MQTT sent.\n", petName, drinkDuration, petDrinkCount); petFinishDataSent = true; }
+                        else { Serial.printf("FAIL to send FINISH DRINKING (Far) for %s\n", petName); }
+                    }
+                } else { if (debugMode) Serial.printf("%s left too soon (Far). Not counted.\n", petName); }
+                petDrinking = false;
+            }
+        }
+    } else { if (petNear) petStableCount = 0; }
+
+    if (petDrinking && !petNear && (currentTime - (petNearStartTime > petDrinkStartTime ? petNearStartTime : petDrinkStartTime) > 15000UL + (unsigned long)MIN_DRINKING_TIME) ) {
+        if (debugMode) Serial.printf("Timeout for %s: drinking, no longer near.\n", petName);
+        if (currentTime - petDrinkStartTime >= (unsigned long)MIN_VALID_DRINKING_TIME) {
+            if (petDataSent && !petFinishDataSent) {
+                unsigned long drinkDuration = (currentTime - petDrinkStartTime) / 1000;
+                petLastDrinkTimestamp = getUnixTimestamp();
+                DynamicJsonDocument doc(384);
+                doc["pet"] = petNum; doc["name"] = petName; doc["action"] = "finish_drinking";
+                doc["reason"] = "timeout_signal_lost"; doc["duration"] = drinkDuration; doc["count"] = petDrinkCount;
+                doc["rssi"] = filteredRSSI; doc["timestamp"] = petLastDrinkTimestamp;
+                char buffer[384]; size_t n = serializeJson(doc, buffer);
+                if (client.publish(topic_pet_drinking, buffer, n)) { if (debugMode) Serial.printf("%s FINISHED DRINKING (Timeout). Dur: %lus. MQTT sent.\n", petName, drinkDuration); petFinishDataSent = true; }
+                else { Serial.printf("FAIL to send FINISH DRINKING (Timeout) for %s\n", petName); }
+            }
+        } else { if (debugMode) Serial.printf("%s signal lost too soon (Timeout). Not counted.\n", petName); }
+        petDrinking = false;
+    }
+}
+
+
+// --- sendStatusUpdate ---
+void sendStatusUpdate() {
+    if (!client.connected()) { return; }
+    DynamicJsonDocument doc(768);
+    doc["status"] = "update"; doc["device_id"] = deviceId; doc["uptime_ms"] = millis();
+    doc["wifi_rssi"] = WiFi.RSSI(); doc["free_heap"] = ESP.getFreeHeap(); doc["timestamp"] = getUnixTimestamp();
+    JsonObject p1 = doc.createNestedObject("pet1"); p1["name"] = pet1Name; p1["last_rssi"] = lastRSSIPet1; p1["is_near"] = pet1Near; p1["is_drinking"] = pet1Drinking; p1["drink_count"] = pet1DrinkCount; p1["last_drink_ts"] = pet1LastDrinkTimestamp;
+    JsonObject p2 = doc.createNestedObject("pet2"); p2["name"] = pet2Name; p2["last_rssi"] = lastRSSIPet2; p2["is_near"] = pet2Near; p2["is_drinking"] = pet2Drinking; p2["drink_count"] = pet2DrinkCount; p2["last_drink_ts"] = pet2LastDrinkTimestamp;
+    JsonObject p3 = doc.createNestedObject("pet3"); p3["name"] = pet3Name; p3["last_rssi"] = lastRSSIPet3; p3["is_near"] = pet3Near; p3["is_drinking"] = pet3Drinking; p3["drink_count"] = pet3DrinkCount; p3["last_drink_ts"] = pet3LastDrinkTimestamp;
+    char buffer[768]; size_t n = serializeJson(doc, buffer);
+    if (!client.publish(topic_device_status, buffer, n)) { Serial.println("Failed to send device status update! MQTT state: " + String(client.state())); }
+    else { if (debugMode) { Serial.println("Device status update sent. Size: " + String(n)); }}
+}
+
+// --- publishCurrentConfig ---
+void publishCurrentConfig() {
+    if (!client.connected()) { return; }
+    DynamicJsonDocument doc(512);
+    doc["rssi_near"] = RSSI_NEAR_THRESHOLD; doc["rssi_far"] = RSSI_FAR_THRESHOLD;
+    doc["status_interval"] = statusInterval; doc["scan_interval"] = scanInterval;
+    doc["min_valid_drinking_time"] = MIN_VALID_DRINKING_TIME; doc["min_drinking_time"] = MIN_DRINKING_TIME;
+    doc["rssi_filter"] = RSSI_FILTER; doc["timestamp"] = getUnixTimestamp();
+    char buffer[512]; size_t n = serializeJson(doc, buffer);
+    if (client.publish(topic_device_config_report, buffer, n)) { if (debugMode) { Serial.println("Published current config."); }}
+    else { Serial.println("Failed to publish current config."); }
+}
+
+// --- handleError, checkHeapMemory, simulateBLEData ---
+void handleError() {
+  Serial.println("System Error Detected. Attempting recovery...");
+  failCount++;
+  if (failCount > 5 && millis() > 300000 ) { Serial.println("Persistent error. Restarting ESP32..."); delay(1000); ESP.restart(); }
+  if (WiFi.status() != WL_CONNECTED) { currentState = WIFI_CONNECTING; return; }
+  else if (!client.connected()) { currentState = MQTT_CONNECTING; lastReconnectAttempt = 0; return; }
+  else if (pBLEScan == nullptr && !testMode) { setupBLE(); if (pBLEScan == nullptr) { ESP.restart(); }}
+  Serial.println("Error state: Connections seem OK. Returning to RUNNING."); currentState = RUNNING; delay(2000);
+}
+
+void checkHeapMemory() {
+  int freeHeap = ESP.getFreeHeap();
+  if (debugMode) { Serial.printf("Free heap: %d bytes\n", freeHeap); }
+  if (freeHeap < 18000 && currentState == RUNNING) { Serial.println("WARNING: Low memory during RUNNING state!"); }
+}
+
+void simulateBLEData() { // For testMode only
+  if (debugMode) Serial.println("Simulating BLE data (Test Mode)");
+  currentRSSIPet1 = random(10) > 5 ? random(-65, -50) : random(-95, -80);
+  currentRSSIPet2 = random(10) > 6 ? random(-68, -52) : random(-92, -78);
+  currentRSSIPet3 = random(10) > 7 ? random(-70, -55) : random(-90, -75);
+  pet1FoundInScan = currentRSSIPet1 > -95;
+  pet2FoundInScan = currentRSSIPet2 > -92;
+  pet3FoundInScan = currentRSSIPet3 > -90;
+}
