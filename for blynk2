@@ -1,0 +1,501 @@
+// src/main.cpp
+#define BLYNK_TEMPLATE_ID "TMPL6NoF0TqpZ"
+#define BLYNK_TEMPLATE_NAME "PetWaterTracker"
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <NimBLEDevice.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
+#include <TimeLib.h>
+
+// --- Virtual Pin Definitions ---
+#define VPIN_PET1_DURATION V1
+#define VPIN_PET1_NAME V2
+#define VPIN_PET1_COUNT V3
+#define VPIN_PET1_LAST_TIME V7
+#define VPIN_PET1_LAST_DATE V20
+
+#define VPIN_PET2_DURATION V4
+#define VPIN_PET2_NAME V5
+#define VPIN_PET2_COUNT V6
+#define VPIN_PET2_LAST_TIME V9
+#define VPIN_PET2_LAST_DATE V21
+
+#define VPIN_PET3_DURATION V13
+#define VPIN_PET3_NAME V14
+#define VPIN_PET3_COUNT V15
+#define VPIN_PET3_LAST_TIME V16
+#define VPIN_PET3_LAST_DATE V22
+
+#define VPIN_RESET_ALL V8
+#define VPIN_RSSI_THRESHOLD_SLIDER V10
+#define VPIN_HEARTBEAT V0
+// --- End of Virtual Pin Definitions ---
+
+// Decision Constants
+int RSSI_ENTER_THRESHOLD = -65;
+#define RSSI_EXIT_THRESHOLD -75
+#define MIN_DRINKING_TIME_SEC 3.0f
+#define MOVEMENT_THRESHOLD 5
+#define MAX_HISTORY_RECORDS 100
+#define RECONNECT_INTERVAL 30000
+#define PRESENCE_CONFIRMATION_SCANS 5
+#define MAX_STATIONARY_DURATION_MS 60000UL
+#define MAX_CONSECUTIVE_MISSES 3
+
+
+// WiFi & Blynk Credentials
+const char* ssid = "edimax_2.4G";
+const char* password = "0645064615";
+const char* auth = "cKT_nZGxgiEljvBknay0OlpHqyu2Yv4n";
+
+// NTP Settings
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.google.com";
+const char* ntpServer3 = "time.cloudflare.com";
+const long gmtOffset_sec = 7 * 3600;
+const int daylightOffset_sec = 0;
+
+// BLE
+NimBLEScan* pBLEScan;
+const int BLE_SCAN_DURATION_SEC = 1;
+
+// Pet State Structure
+struct PetState {
+    const char* name; const char* targetName; const char* targetMAC;
+    int rssiBuffer[10]; float filteredRSSI; bool isNearby;
+    unsigned long startTimeMs; bool dataSent; int drinkingCount;
+    String lastDrinkTimeStr; String lastDrinkDateStr; int presenceConfirmCount;
+    int consecutiveMissCount;
+    int pinDuration, pinNameDisplay, pinCountDisplay, pinLastTimeDisplay, pinLastDateDisplay;
+    const char* blynkEventName;
+};
+
+PetState pets[3] = {
+    {"กะเพรา", "R24030513", "51:00:24:03:02:01", {-100}, -100.0f, false, 0, true, 0, "--:--", "--/--/----", 0, 0, VPIN_PET1_DURATION, VPIN_PET1_NAME, VPIN_PET1_COUNT, VPIN_PET1_LAST_TIME, VPIN_PET1_LAST_DATE, "pet1_drinking"},
+    {"ลัคกี้", "Petkit_P3C", "A4:C1:38:6A:8F:DB", {-100}, -100.0f, false, 0, true, 0, "--:--", "--/--/----", 0, 0, VPIN_PET2_DURATION, VPIN_PET2_NAME, VPIN_PET2_COUNT, VPIN_PET2_LAST_TIME, VPIN_PET2_LAST_DATE, "pet2_drinking"},
+    {"งับบี้", "R24120200", "51:00:24:12:00:C8", {-100}, -100.0f, false, 0, true, 0, "--:--", "--/--/----", 0, 0, VPIN_PET3_DURATION, VPIN_PET3_NAME, VPIN_PET3_COUNT, VPIN_PET3_LAST_TIME, VPIN_PET3_LAST_DATE, "pet3_drinking"}
+};
+int activePetIndex = -1;
+
+unsigned long lastResetTimeMillis = 0; unsigned long lastReconnectAttempt = 0; unsigned long lastHeartbeatTime = 0;
+bool wifiConnected = false; bool blynkConnected = false;
+const int SCAN_INTERVAL_MS = 1000;
+unsigned long lastScanTime = 0; unsigned long lastTimeDebugPrint = 0; const unsigned long timeDebugInterval = 10000;
+
+struct DrinkingRecord { String petName; float duration; time_t timestamp; };
+DrinkingRecord drinkingHistory[MAX_HISTORY_RECORDS]; int historyIndex = 0;
+
+struct PetScanData { bool foundThisScan; int avgRSSI; bool isMoving; int petIndex; };
+
+// --- FUNCTION PROTOTYPES ---
+void initNTP(); void connectWiFi(); void connectBlynk(); void setupBLE(); void checkConnections();
+void resetDailyCounters(); void performBLEScan();
+void processScannedPet(int petIndex, bool isNowStrongestAndValidCandidate, bool wasPetFoundInScan, int scannedAvgRSSI, bool scannedIsMoving);
+bool calculateMovement(int* rssiBuffer); void updateRSSIBufferAndFilter(int petIndex, int newRSSI);
+void sendToBlynkPetData(int petIndex, float duration); void syncAllDataToBlynk();
+void saveHistoryData(const char* petName, float duration); void saveHistoryToSPIFFS(); void loadHistoryFromSPIFFS();
+void initializePetStates();
+
+// --- FUNCTION IMPLEMENTATIONS ---
+void initializePetStates() {
+    for(int i=0; i<3; ++i) {
+        for(int j=0; j<10; ++j) pets[i].rssiBuffer[j] = -100;
+        pets[i].filteredRSSI = -100.0f; pets[i].isNearby = false; pets[i].startTimeMs = 0;
+        pets[i].dataSent = true; pets[i].presenceConfirmCount = 0; pets[i].consecutiveMissCount = 0;
+    }
+    activePetIndex = -1;
+}
+
+void initNTP() {
+  Serial.println("NTP: Initializing...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
+  Serial.print("NTP: Waiting for system time synchronization");
+  struct tm timeinfo; int retries = 0;
+  while ((!getLocalTime(&timeinfo, 1000) || timeinfo.tm_year < (2024 - 1900)) && retries < 15) { Serial.print("."); retries++; }
+  Serial.println();
+  if (timeinfo.tm_year < (2024 - 1900)) Serial.println("NTP: Failed to obtain valid system time.");
+  else {
+    Serial.print("NTP: System time synchronized (Local): "); Serial.println(&timeinfo, "%A, %d %B %Y %H:%M:%S");
+    time_t utc_epoch = mktime(&timeinfo);
+    if (year(utc_epoch) >= 2024) {
+        setTime(utc_epoch);
+        Serial.print("TimeLib: Set with UTC epoch. Current TimeLib (UTC H:M:S D/M/Y): ");
+        Serial.printf("%02d:%02d:%02d %02d/%02d/%04d\n", hour(), minute(), second(), day(), month(), year());
+    } else Serial.println("TimeLib: UTC Epoch from mktime invalid.");
+  }
+}
+
+void setupBLE() {
+  Serial.println("BLE: Initializing NimBLE...");
+  NimBLEDevice::init(""); pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setActiveScan(true); pBLEScan->setInterval(100); pBLEScan->setWindow(99); pBLEScan->setDuplicateFilter(false);
+  Serial.println("BLE: NimBLE setup completed.");
+}
+
+void setup() {
+  Serial.begin(115200); Serial.println("\nStarting Pet Water Tracker (Advanced Logic)...");
+  initializePetStates();
+  if (!SPIFFS.begin(true)) Serial.println("SPIFFS: Init failed!");
+  else { Serial.println("SPIFFS: Init success."); loadHistoryFromSPIFFS(); }
+  connectWiFi();
+  if (wifiConnected) initNTP(); else Serial.println("WiFi: Not connected. NTP skip.");
+  connectBlynk(); setupBLE(); Serial.println("System: Setup completed.");
+}
+
+void loop() {
+  checkConnections(); if (blynkConnected) Blynk.run(); resetDailyCounters();
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastScanTime >= SCAN_INTERVAL_MS) {
+    lastScanTime = currentMillis;
+    if (pBLEScan != nullptr && !pBLEScan->isScanning()) performBLEScan();
+    else if (pBLEScan == nullptr) Serial.println("Error: pBLEScan is null!");
+  }
+  if (currentMillis - lastHeartbeatTime >= 300000) {
+    lastHeartbeatTime = currentMillis;
+    if (blynkConnected) Blynk.virtualWrite(VPIN_HEARTBEAT, millis() / 1000);
+  }
+  unsigned long cMDT = millis();
+  if (cMDT - lastTimeDebugPrint >= timeDebugInterval) {
+    lastTimeDebugPrint = cMDT;
+    if (wifiConnected && year() >= 2024) {
+        time_t t_utc = now(), t_loc = t_utc + gmtOffset_sec;
+        Serial.printf("TIME_DEBUG: UTC(H%d M%d S%d D%02dM%02dY%d) Local(H%d M%d S%d D%02dM%02dY%d)\n",
+                      hour(t_utc), minute(t_utc), second(t_utc), day(t_utc), month(t_utc), year(t_utc),
+                      hour(t_loc), minute(t_loc), second(t_loc), day(t_loc), month(t_loc), year(t_loc));
+    }
+  }
+}
+
+void performBLEScan() {
+  if (!wifiConnected || pBLEScan == nullptr) return;
+  NimBLEScanResults foundDevices = pBLEScan->start(BLE_SCAN_DURATION_SEC, false);
+
+  PetScanData petScanResults[3];
+  for(int i=0; i<3; ++i) {petScanResults[i].petIndex = i; petScanResults[i].foundThisScan = false; petScanResults[i].avgRSSI = -100; petScanResults[i].isMoving = true;}
+  
+  int currentScanStrongestPetIdx = -1; 
+  float currentScanStrongestSignal = -200.0f;
+
+  for (int i = 0; i < foundDevices.getCount(); i++) {
+    NimBLEAdvertisedDevice advDev = foundDevices.getDevice(i);
+    String devName = advDev.haveName() ? advDev.getName().c_str() : "";
+    String devMAC = advDev.getAddress().toString().c_str(); devMAC.toUpperCase();
+    int rssi = advDev.getRSSI();
+
+    for (int pIdx = 0; pIdx < 3; ++pIdx) {
+        String targetMACStr = String(pets[pIdx].targetMAC); targetMACStr.toUpperCase();
+        if ((devName.length() > 0 && devName == pets[pIdx].targetName) || devMAC == targetMACStr) {
+            updateRSSIBufferAndFilter(pIdx, rssi);
+            petScanResults[pIdx].foundThisScan = true;
+            petScanResults[pIdx].avgRSSI = pets[pIdx].filteredRSSI;
+            petScanResults[pIdx].isMoving = calculateMovement(pets[pIdx].rssiBuffer);
+            
+            if (!pets[pIdx].isNearby && 
+                petScanResults[pIdx].avgRSSI > RSSI_ENTER_THRESHOLD && 
+                !petScanResults[pIdx].isMoving) {
+                if (petScanResults[pIdx].avgRSSI > currentScanStrongestSignal) {
+                    currentScanStrongestSignal = petScanResults[pIdx].avgRSSI;
+                    currentScanStrongestPetIdx = pIdx;
+                }
+            }
+            break; 
+        }
+    }
+  }
+  
+  bool anyPetFoundRelevant = false;
+  for(int i=0; i<3; ++i) if(petScanResults[i].foundThisScan) anyPetFoundRelevant = true;
+  if (anyPetFoundRelevant) {
+    Serial.print("BLE Scan: ");
+    for(int i=0; i<3; ++i) Serial.printf("P%d(F%d,R%.0f,M%d,Nearby%d,Conf%d,Miss%d) ", i+1, petScanResults[i].foundThisScan, petScanResults[i].avgRSSI, petScanResults[i].isMoving, pets[i].isNearby, pets[i].presenceConfirmCount, pets[i].consecutiveMissCount);
+    if(currentScanStrongestPetIdx != -1 && activePetIndex == -1) Serial.printf("-> NewCand:P%d ", currentScanStrongestPetIdx + 1);
+    else if (activePetIndex != -1) Serial.printf("-> Active:P%d ", activePetIndex + 1);
+    else Serial.print("-> No Cand/Active ");
+    Serial.println();
+  }
+
+  if (activePetIndex != -1) { 
+    processScannedPet(activePetIndex, 
+                      true, // It IS the primary candidate because it's already active
+                      petScanResults[activePetIndex].foundThisScan, 
+                      petScanResults[activePetIndex].avgRSSI, 
+                      petScanResults[activePetIndex].isMoving);
+    for (int i = 0; i < 3; ++i) {
+        if (i != activePetIndex) {
+             pets[i].presenceConfirmCount = 0; 
+             if (pets[i].isNearby) { 
+                 Serial.println("PROCESS_WARN: Pet " + String(pets[i].name) + " was Nearby but P" + String(activePetIndex+1) + " is active! Resetting " + String(pets[i].name));
+                 pets[i].isNearby = false; pets[i].dataSent = true; pets[i].consecutiveMissCount = 0;
+             }
+        }
+    }
+  } else { 
+    if (currentScanStrongestPetIdx != -1) {
+      processScannedPet(currentScanStrongestPetIdx, 
+                        true, 
+                        petScanResults[currentScanStrongestPetIdx].foundThisScan, 
+                        petScanResults[currentScanStrongestPetIdx].avgRSSI, 
+                        petScanResults[currentScanStrongestPetIdx].isMoving);
+      for (int i = 0; i < 3; ++i) {
+        if (i != currentScanStrongestPetIdx) pets[i].presenceConfirmCount = 0;
+      }
+    } else { 
+      for (int i = 0; i < 3; ++i) {
+          if (!petScanResults[i].foundThisScan) pets[i].presenceConfirmCount = 0;
+          else if (!(petScanResults[i].avgRSSI > RSSI_ENTER_THRESHOLD && !petScanResults[i].isMoving)) pets[i].presenceConfirmCount = 0;
+      }
+    }
+  }
+}
+
+void processScannedPet(int petIndex, bool isPrimaryCandidate, bool wasPetFoundInScan, int scannedAvgRSSI, bool scannedIsMoving) {
+    PetState &pet = pets[petIndex];
+
+    if (pet.isNearby) { 
+        if (!wasPetFoundInScan) { 
+            pet.consecutiveMissCount++;
+            Serial.println("PROCESS: " + String(pet.name) + " (Active) Beacon NOT SEEN. Miss count: " + String(pet.consecutiveMissCount));
+            if (pet.consecutiveMissCount >= MAX_CONSECUTIVE_MISSES) {
+                Serial.println("PROCESS: " + String(pet.name) + " Missed too many times. Ending session.");
+                unsigned long durationMillis = millis() - pet.startTimeMs;
+                float durationInSeconds = durationMillis / 1000.0f;
+                if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
+                    pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
+                    Serial.println("PROCESS: " + String(pet.name) + " session ended (Recorded, beacon loss).");
+                } else Serial.println("PROCESS: " + String(pet.name) + " session ended too soon (beacon loss).");
+                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0;
+                if(activePetIndex == petIndex) activePetIndex = -1;
+            }
+        } else { 
+            pet.consecutiveMissCount = 0; 
+            if (millis() - pet.startTimeMs > MAX_STATIONARY_DURATION_MS) {
+                Serial.println("PROCESS: " + String(pet.name) + " (Active) MAX_STATIONARY. Reset.");
+                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; activePetIndex = -1; 
+            } else if (scannedAvgRSSI <= RSSI_EXIT_THRESHOLD || scannedIsMoving) {
+                Serial.println("PROCESS: " + String(pet.name) + " (Active) Left/Moved. Dur: " + String((millis() - pet.startTimeMs) / 1000.0f, 1) + "s");
+                unsigned long durationMillis = millis() - pet.startTimeMs; float durationInSeconds = durationMillis / 1000.0f;
+                if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
+                    pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
+                    Serial.println("PROCESS: " + String(pet.name) + " Left (Recorded).");
+                } else Serial.println("PROCESS: " + String(pet.name) + " Left too soon.");
+                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; activePetIndex = -1;
+            }
+        }
+    } else { 
+        if (isPrimaryCandidate && wasPetFoundInScan && scannedAvgRSSI > RSSI_ENTER_THRESHOLD && !scannedIsMoving) {
+            if (activePetIndex == -1) { 
+                pet.presenceConfirmCount++;
+                Serial.println("PROCESS: " + String(pet.name) + " Confirming: " + String(pet.presenceConfirmCount) + "/" + String(PRESENCE_CONFIRMATION_SCANS));
+                if (pet.presenceConfirmCount >= PRESENCE_CONFIRMATION_SCANS) {
+                    activePetIndex = petIndex; 
+                    pet.isNearby = true; pet.startTimeMs = millis(); pet.dataSent = false; pet.consecutiveMissCount = 0;
+                    Serial.println("PROCESS: " + String(pet.name) + " Nearby (Confirmed)! Timer ON. ActivePet: P" + String(activePetIndex + 1));
+                    if (blynkConnected) Blynk.logEvent(pet.blynkEventName, String(pet.name) + "เริ่มดื่มน้ำ!");
+                    pet.presenceConfirmCount = 0; 
+                }
+            } else { 
+                 pet.presenceConfirmCount = 0;
+            }
+        } else { 
+            pet.presenceConfirmCount = 0;
+        }
+    }
+}
+
+bool calculateMovement(int* rssiBuffer) {
+  float variation = 0; int validReadings = 0;
+  for (int i = 1; i < 10; i++) {
+    if (rssiBuffer[i-1] > -100 && rssiBuffer[i-1] < 0 && rssiBuffer[i] > -100 && rssiBuffer[i] < 0) {
+        variation += abs(rssiBuffer[i] - rssiBuffer[i-1]); validReadings++;
+    }
+  }
+  if (validReadings < 2) return false;
+  return (variation / (float)validReadings) > MOVEMENT_THRESHOLD;
+}
+
+void updateRSSIBufferAndFilter(int petIndex, int newRSSI) {
+    PetState &pet = pets[petIndex];
+    for (int i = 9; i > 0; i--) pet.rssiBuffer[i] = pet.rssiBuffer[i - 1];
+    pet.rssiBuffer[0] = (newRSSI < 0 && newRSSI >= -100) ? newRSSI : -100;
+    long sum = 0; int count = 0;
+    for (int i = 0; i < 10; i++) {
+        if(pet.rssiBuffer[i] > -100 && pet.rssiBuffer[i] < 0){ sum += pet.rssiBuffer[i]; count++; }
+    }
+    if (count > 0) pet.filteredRSSI = (float)sum / count; else pet.filteredRSSI = -100.0f;
+}
+
+void sendToBlynkPetData(int petIndex, float duration) {
+    PetState &pet = pets[petIndex];
+    if (blynkConnected) {
+        Blynk.virtualWrite(pet.pinDuration, duration); Blynk.virtualWrite(pet.pinCountDisplay, pet.drinkingCount);
+        time_t t_utc = now(), t_local = t_utc + gmtOffset_sec;
+        int cH = hour(t_local), cM = minute(t_local), cD = day(t_local), cMo = month(t_local), cY = year(t_local);
+        if (cY < 2024) {
+            Serial.println("TIME_DEBUG: sendToBlynk - Local time not valid! Using default.");
+            pet.lastDrinkTimeStr = "--:--"; pet.lastDrinkDateStr = "--/--/----";
+        } else {
+            char tb[9]; sprintf(tb, "%02d:%02d", cH, cM); pet.lastDrinkTimeStr = String(tb);
+            char db[11]; sprintf(db, "%02d/%02d/%04d", cD, cMo, cY); pet.lastDrinkDateStr = String(db);
+        }
+        Blynk.virtualWrite(pet.pinLastTimeDisplay, pet.lastDrinkTimeStr); Blynk.virtualWrite(pet.pinLastDateDisplay, pet.lastDrinkDateStr);
+        Serial.println("BlynkTX: " + String(pet.name) + " Dur:" + String(duration,1) + "s Cnt:" + String(pet.drinkingCount) + " T:" + pet.lastDrinkTimeStr + " D:" + pet.lastDrinkDateStr);
+    } else Serial.println("Blynk N/C. Data for " + String(pet.name) + " not sent.");
+}
+
+void syncAllDataToBlynk() {
+  if (blynkConnected) {
+    Serial.println("Blynk: Syncing all data...");
+    for (int i=0; i<3; ++i) {
+        Blynk.virtualWrite(pets[i].pinNameDisplay, pets[i].name);
+        Blynk.virtualWrite(pets[i].pinCountDisplay, pets[i].drinkingCount);
+        Blynk.virtualWrite(pets[i].pinLastTimeDisplay, pets[i].lastDrinkTimeStr);
+        Blynk.virtualWrite(pets[i].pinLastDateDisplay, pets[i].lastDrinkDateStr);
+    }
+    Blynk.virtualWrite(VPIN_RSSI_THRESHOLD_SLIDER, RSSI_ENTER_THRESHOLD);
+    Serial.println("Blynk: Sync complete.");
+  }
+}
+
+void resetDailyCounters() {
+  time_t t_utc = now();
+  if (timeStatus() == timeNotSet || year(t_utc + gmtOffset_sec) < 2024) {
+     unsigned long cM = millis(); if (lastResetTimeMillis == 0) lastResetTimeMillis = cM;
+     if (cM - lastResetTimeMillis >= 86400000UL) {
+        Serial.println("SYS: Daily Reset (millis)...");
+        for(int i=0; i<3; ++i) { pets[i].drinkingCount=0; pets[i].lastDrinkTimeStr="--:--"; pets[i].lastDrinkDateStr="--/--/----"; }
+        lastResetTimeMillis = cM; if (blynkConnected) syncAllDataToBlynk();
+     } return;
+  }
+  static int lastResetDay = 0; time_t t_loc = t_utc + gmtOffset_sec;
+  if (lastResetDay == 0 ) lastResetDay = day(t_loc);
+  if (day(t_loc) != lastResetDay) {
+    Serial.println("SYS: Daily Reset (date)...");
+    for(int i=0; i<3; ++i) { pets[i].drinkingCount=0; pets[i].lastDrinkTimeStr="--:--"; pets[i].lastDrinkDateStr="--/--/----"; }
+    lastResetDay = day(t_loc); if (blynkConnected) syncAllDataToBlynk();
+  }
+}
+
+void saveHistoryData(const char* petName, float duration) {
+  time_t t_utc = now();
+  if (year(t_utc + gmtOffset_sec) < 2024) { Serial.println("SPIFFS: Local time invalid, history not saved."); return; }
+  drinkingHistory[historyIndex].petName = String(petName);
+  drinkingHistory[historyIndex].duration = duration;
+  drinkingHistory[historyIndex].timestamp = t_utc;
+  historyIndex = (historyIndex + 1) % MAX_HISTORY_RECORDS;
+  static int recSinceLastSave = 0; recSinceLastSave++;
+  if (recSinceLastSave >= 5) { saveHistoryToSPIFFS(); recSinceLastSave = 0; }
+}
+
+void saveHistoryToSPIFFS() {
+  DynamicJsonDocument doc(16384); JsonArray array = doc.to<JsonArray>(); int validRecs = 0;
+  for(int i=0; i<MAX_HISTORY_RECORDS; ++i) if(drinkingHistory[i].timestamp > 0 && year(drinkingHistory[i].timestamp + gmtOffset_sec) > 2023) validRecs++;
+  if (validRecs == 0) { if (SPIFFS.exists("/history.json")) SPIFFS.remove("/history.json"); return; }
+  int currWIdx = historyIndex; bool isFull = (validRecs == MAX_HISTORY_RECORDS);
+  for (int i = 0; i < validRecs; i++) {
+      int rIdx = isFull ? (currWIdx + i) % MAX_HISTORY_RECORDS : i;
+      if (drinkingHistory[rIdx].timestamp > 0 && year(drinkingHistory[rIdx].timestamp + gmtOffset_sec) > 2023) {
+          JsonObject obj = array.createNestedObject(); obj["petName"] = drinkingHistory[rIdx].petName;
+          obj["duration"] = drinkingHistory[rIdx].duration; obj["timestamp"] = drinkingHistory[rIdx].timestamp;
+      }
+  }
+  if (array.size() == 0) { if (SPIFFS.exists("/history.json")) SPIFFS.remove("/history.json"); return; }
+  File file = SPIFFS.open("/history.json", "w"); if (!file) { Serial.println("SPIFFS: Open fail (w)."); return; }
+  size_t written = serializeJson(doc, file); file.close();
+  if (written == 0 && array.size() > 0) Serial.println("SPIFFS: Write fail (0 bytes).");
+  else if (array.size() > 0) Serial.println("SPIFFS: " + String(written) + " bytes saved.");
+}
+
+void loadHistoryFromSPIFFS() {
+  for(int i=0; i<MAX_HISTORY_RECORDS; ++i) drinkingHistory[i].timestamp = 0; historyIndex = 0;
+  if (!SPIFFS.exists("/history.json")) { Serial.println("SPIFFS: History file not found."); return; }
+  File file = SPIFFS.open("/history.json", "r"); if (!file) { Serial.println("SPIFFS: Open fail (r)."); return; }
+  if (file.size() == 0) { Serial.println("SPIFFS: History file empty."); file.close(); return; }
+  DynamicJsonDocument doc(16384); DeserializationError err = deserializeJson(doc, file); file.close();
+  if (err) { Serial.print("SPIFFS: Parse fail: "); Serial.println(err.c_str()); return; }
+  JsonArray array = doc.as<JsonArray>();
+  for (JsonObject obj : array) {
+    time_t ts = obj["timestamp"].as<time_t>(); if (year(ts + gmtOffset_sec) < 2024) continue;
+    if (historyIndex < MAX_HISTORY_RECORDS) {
+      drinkingHistory[historyIndex].petName = obj["petName"].as<String>();
+      drinkingHistory[historyIndex].duration = obj["duration"].as<float>();
+      drinkingHistory[historyIndex].timestamp = ts; historyIndex++;
+    } else { Serial.println("SPIFFS: History > MAX_RECORDS."); break; }
+  }
+  Serial.println("SPIFFS: History loaded. Records: " + String(historyIndex));
+}
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; return; }
+  Serial.print("WiFi: Connecting to ["); Serial.print(ssid); Serial.print("]...");
+  WiFi.mode(WIFI_STA); WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
+  if (WiFi.status() == WL_CONNECTED) { Serial.println("\nWiFi: Connected. IP: " + WiFi.localIP().toString()); wifiConnected = true; }
+  else { Serial.println("\nWiFi: Connection Failed."); wifiConnected = false; }
+}
+
+void connectBlynk() {
+  if (!wifiConnected) { Serial.println("Blynk: WiFi not connected."); return; }
+  Serial.print("Blynk: Connecting to server...");
+  Blynk.config(auth);
+  if (Blynk.connect(5000)) { Serial.println("\nBlynk: Connected."); blynkConnected = true; }
+  else { Serial.println("\nBlynk: Connection Failed (timeout)."); blynkConnected = false; }
+}
+
+void checkConnections() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastReconnectAttempt >= RECONNECT_INTERVAL) {
+    lastReconnectAttempt = currentMillis;
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("SYS: WiFi disconnected. Reconnecting...");
+      wifiConnected = false; blynkConnected = false;
+      connectWiFi();
+      if (wifiConnected) { initNTP(); connectBlynk(); }
+    } else {
+      wifiConnected = true;
+      if (!Blynk.connected()) { Serial.println("SYS: Blynk disconnected. Reconnecting..."); connectBlynk(); }
+      else blynkConnected = true;
+    }
+  }
+}
+
+BLYNK_CONNECTED() {
+  Serial.println("Blynk: Connected (event handler).");
+  blynkConnected = true;
+  syncAllDataToBlynk();
+}
+
+BLYNK_WRITE(VPIN_RESET_ALL) {
+  int value = param.asInt();
+  if (value == 1) {
+    Serial.println("Blynk V8: Reset All initiated...");
+    for(int i=0; i<3; ++i) {
+        pets[i].drinkingCount = 0; pets[i].presenceConfirmCount = 0;
+        pets[i].isNearby = false; pets[i].dataSent = true;
+        pets[i].lastDrinkTimeStr = "--:--"; pets[i].lastDrinkDateStr = "--/--/----";
+        pets[i].consecutiveMissCount = 0;
+    }
+    activePetIndex = -1;
+    for (int i = 0; i < MAX_HISTORY_RECORDS; i++) {
+      drinkingHistory[i].petName = ""; drinkingHistory[i].duration = 0; drinkingHistory[i].timestamp = 0;
+    }
+    historyIndex = 0;
+    Serial.println("SYS: In-memory history cleared.");
+    if (SPIFFS.exists("/history.json")) {
+      if (SPIFFS.remove("/history.json")) Serial.println("SPIFFS: History file deleted.");
+      else Serial.println("SPIFFS: Failed to delete history file.");
+    } else Serial.println("SPIFFS: No history file to delete.");
+    syncAllDataToBlynk();
+    Blynk.virtualWrite(VPIN_RESET_ALL, 0);
+    Serial.println("SYS: All data reset completed.");
+  }
+}
+
+BLYNK_WRITE(VPIN_RSSI_THRESHOLD_SLIDER) {
+  RSSI_ENTER_THRESHOLD = param.asInt();
+  Serial.print("Blynk V10: RSSI Enter Threshold set to: "); Serial.println(RSSI_ENTER_THRESHOLD);
+  Blynk.virtualWrite(VPIN_RSSI_THRESHOLD_SLIDER, RSSI_ENTER_THRESHOLD);
+}
