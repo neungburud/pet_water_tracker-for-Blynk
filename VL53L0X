@@ -1,0 +1,531 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include "Adafruit_VL53L0X.h"
+
+// ===== การกำหนดค่าตามการต่อสายของคุณ =====
+const int SDA_BUS1 = 19, SCL_BUS1 = 22;  // เซนเซอร์ #1, #2
+const int SDA_BUS2 = 25, SCL_BUS2 = 26;  // เซนเซอร์ #3, #4
+
+// สร้าง I2C instances
+TwoWire I2C_Bus1 = TwoWire(0);
+TwoWire I2C_Bus2 = TwoWire(1);
+
+// สร้าง sensor objects
+Adafruit_VL53L0X sensor_bus1, sensor_bus2;
+
+// ตัวแปรหลัก
+uint16_t distances[2] = {0, 0};
+String busNames[2] = {"Bus1(S1+S2)", "Bus2(S3+S4)"};
+bool sensorReady[2] = {false, false};
+unsigned long detectionCount = 0;
+
+// ตัวแปรสำหรับการกรองข้อมูล
+uint16_t stableDistances[2] = {500, 500};
+unsigned long lastDetection = 0;
+
+// ตัวแปรสำหรับบันทึกเวลาการดื่มน้ำ
+unsigned long drinkingStartTime[2] = {0, 0};
+unsigned long drinkingEndTime[2] = {0, 0};
+unsigned long totalDrinkingTime[2] = {0, 0};
+bool isDrinking[2] = {false, false};
+int drinkingSession = 0;
+
+// ===== SETUP =====
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("╔══════════════════════════════════════╗");
+  Serial.println("║     ระบบตรวจจับสัตว์เลี้ยง (Fixed)   ║");
+  Serial.println("║    VL53L0X Pet Detection System     ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.println();
+  
+  Serial.println("📋 การต่อสายของคุณ:");
+  Serial.println("   เซนเซอร์ #1,#2: SDA=GPIO19, SCL=GPIO22");
+  Serial.println("   เซนเซอร์ #3,#4: SDA=GPIO25, SCL=GPIO26");
+  Serial.println();
+  
+  // เริ่มต้น I2C Bus
+  Serial.println("🔧 เริ่มต้น I2C Bus...");
+  I2C_Bus1.begin(SDA_BUS1, SCL_BUS1, 100000);
+  I2C_Bus2.begin(SDA_BUS2, SCL_BUS2, 100000);
+  delay(1000);  // เพิ่มเวลารอ
+  
+  // เริ่มต้นเซนเซอร์
+  Serial.println("═══ เริ่มต้นเซนเซอร์ด้วย Adafruit Library ═══");
+  
+  Serial.print("🔍 เริ่มต้น Bus 1... ");
+  if (sensor_bus1.begin(VL53L0X_I2C_ADDR, false, &I2C_Bus1)) {
+    sensorReady[0] = true;
+    Serial.println("✅ สำเร็จ");
+    
+    // ตั้งค่าการวัด
+    sensor_bus1.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_DEFAULT);
+    delay(100);
+  } else {
+    Serial.println("❌ ล้มเหลว");
+  }
+  
+  Serial.print("🔍 เริ่มต้น Bus 2... ");
+  if (sensor_bus2.begin(VL53L0X_I2C_ADDR, false, &I2C_Bus2)) {
+    sensorReady[1] = true;
+    Serial.println("✅ สำเร็จ");
+    
+    // ตั้งค่าการวัด
+    sensor_bus2.configSensor(Adafruit_VL53L0X::VL53L0X_SENSE_DEFAULT);
+    delay(100);
+  } else {
+    Serial.println("❌ ล้มเหลว");
+  }
+  
+  // สรุปผล
+  int working = sensorReady[0] + sensorReady[1];
+  Serial.println();
+  Serial.print("📊 ผลสรุป: ");
+  Serial.print(working);
+  Serial.println("/2 Bus พร้อมใช้งาน");
+  
+  if (working > 0) {
+    Serial.println("🚀 ระบบพร้อมทำงาน!");
+    
+    // ทดสอบการอ่านค่าครั้งแรก
+    Serial.println();
+    Serial.println("🧪 ทดสอบการอ่านค่าเบื้องต้น:");
+    testInitialReading();
+    
+    // สอบเทียบค่าพื้นฐาน
+    Serial.println();
+    calibrateBaseline();
+  } else {
+    Serial.println("⚠️ ไม่มีเซนเซอร์ที่ใช้งานได้!");
+    Serial.println("💡 ตรวจสอบการต่อสาย VIN, GND, SDA, SCL");
+  }
+  
+  Serial.println("════════════════════════════════");
+  Serial.println();
+}
+
+// ===== LOOP =====
+void loop() {
+  static unsigned long lastReading = 0;
+  static unsigned long lastDisplay = 0;
+  static unsigned long lastStatistics = 0;
+  
+  // อ่านค่าทุก 300ms
+  if (millis() - lastReading >= 300) {
+    readSensors();
+    detectMovement();
+    lastReading = millis();
+  }
+  
+  // แสดงผลทุก 3 วินาที
+  if (millis() - lastDisplay >= 3000) {
+    displayResults();
+    lastDisplay = millis();
+  }
+  
+  // แสดงสถิติทุก 30 วินาที
+  if (millis() - lastStatistics >= 30000) {
+    displayDrinkingStatistics();
+    lastStatistics = millis();
+  }
+  
+  delay(100);
+}
+
+// ===== ฟังก์ชันเสริม =====
+
+void testInitialReading() {
+  for (int i = 0; i < 2; i++) {
+    if (sensorReady[i]) {
+      Serial.print("   ");
+      Serial.print(busNames[i]);
+      Serial.print(": ");
+      
+      // อ่านค่าด้วย single shot mode
+      uint16_t distance = 0;
+      if (i == 0) {
+        distance = sensor_bus1.readRange();
+      } else {
+        distance = sensor_bus2.readRange();
+      }
+      
+      if (distance > 0 && distance < 4000) {
+        Serial.print(distance);
+        Serial.println("mm ✅");
+      } else {
+        Serial.print(distance);
+        Serial.println("mm ❌ (ผิดปกติ)");
+      }
+    }
+  }
+}
+
+void calibrateBaseline() {
+  Serial.println("📝 สอบเทียบค่าพื้นฐาน...");
+  Serial.println("   (อย่าเคลื่อนไหวหน้าเซนเซอร์ 5 วินาที)");
+  
+  uint32_t sum[2] = {0, 0};
+  int count[2] = {0, 0};
+  uint16_t readings[2][10];  // เก็บค่าการอ่าน 10 ครั้ง
+  
+  for (int i = 0; i < 10; i++) {
+    delay(500);
+    readSensors();
+    
+    for (int j = 0; j < 2; j++) {
+      if (sensorReady[j] && distances[j] != 0xFFFF && distances[j] > 10 && distances[j] < 2000) {
+        readings[j][count[j]] = distances[j];
+        sum[j] += distances[j];
+        count[j]++;
+      }
+    }
+    Serial.print(".");
+  }
+  Serial.println();
+  
+  // คำนวณค่าเฉลี่ยและ standard deviation
+  for (int i = 0; i < 2; i++) {
+    if (count[i] > 7) {  // ต้องมีการอ่านสำเร็จอย่างน้อย 7 ครั้ง
+      stableDistances[i] = sum[i] / count[i];
+      
+      // คำนวณ standard deviation
+      uint32_t variance = 0;
+      for (int j = 0; j < count[i]; j++) {
+        int diff = readings[i][j] - stableDistances[i];
+        variance += diff * diff;
+      }
+      uint16_t stdDev = sqrt(variance / count[i]);
+      
+      Serial.print("✅ ");
+      Serial.print(busNames[i]);
+      Serial.print(" ค่าพื้นฐาน: ");
+      Serial.print(stableDistances[i]);
+      Serial.print("mm (±");
+      Serial.print(stdDev);
+      Serial.println("mm)");
+    } else {
+      stableDistances[i] = 500;  // ค่าเริ่มต้น
+      Serial.print("⚠️ ");
+      Serial.print(busNames[i]);
+      Serial.println(" ข้อมูลไม่เพียงพอ - ใช้ค่าเริ่มต้น 500mm");
+    }
+  }
+  Serial.println();
+}
+
+void readSensors() {
+  // อ่านจาก Bus 1
+  if (sensorReady[0]) {
+    uint16_t reading = sensor_bus1.readRange();
+    
+    // กรองค่าผิดปกติ
+    if (reading > 0 && reading < 4000) {
+      distances[0] = reading;
+    } else {
+      distances[0] = 0xFFFF;
+    }
+  }
+  
+  // อ่านจาก Bus 2
+  if (sensorReady[1]) {
+    uint16_t reading = sensor_bus2.readRange();
+    
+    // กรองค่าผิดปกติ
+    if (reading > 0 && reading < 4000) {
+      distances[1] = reading;
+    } else {
+      distances[1] = 0xFFFF;
+    }
+  }
+}
+
+void detectMovement() {
+  const uint16_t THRESHOLD = 100;       // เพิ่มเป็น 100mm เพื่อลดความไว
+  const uint16_t MIN_DISTANCE = 30;     // ระยะทางต่ำสุด
+  const uint16_t MAX_DISTANCE = 1500;   // ระยะทางสูงสุด
+  const unsigned long COOLDOWN = 15000; // เพิ่มเป็น 15 วินาที
+  const uint16_t RETURN_THRESHOLD = 50; // เกณฑ์กลับสู่ปกติ
+  
+  static int consecutiveChanges[2] = {0, 0};
+  static bool detectionActive[2] = {false, false};
+  static unsigned long lastActivity[2] = {0, 0};
+  static uint16_t originalBaseline[2] = {0, 0};
+  
+  for (int i = 0; i < 2; i++) {
+    if (sensorReady[i] && distances[i] != 0xFFFF) {
+      
+      // บันทึก baseline ครั้งแรก
+      if (originalBaseline[i] == 0) {
+        originalBaseline[i] = stableDistances[i];
+      }
+      
+      // คำนวณการเปลี่ยนแปลงจาก baseline เดิม
+      uint16_t changeFromOriginal = abs((int16_t)distances[i] - (int16_t)originalBaseline[i]);
+      
+      // ตรวจสอบว่าอยู่ในช่วงที่สนใจ
+      if (distances[i] >= MIN_DISTANCE && distances[i] <= MAX_DISTANCE) {
+        
+        // ถ้ากำลังตรวจจับอยู่ ตรวจสอบว่ากลับสู่ปกติหรือยัง
+        if (detectionActive[i]) {
+          if (changeFromOriginal < RETURN_THRESHOLD) {
+            // กลับสู่ปกติแล้ว - บันทึกเวลาสิ้นสุดการดื่ม
+            detectionActive[i] = false;
+            consecutiveChanges[i] = 0;
+            lastActivity[i] = millis();
+            
+            // คำนวณระยะเวลาการดื่ม
+            if (isDrinking[i]) {
+              drinkingEndTime[i] = millis();
+              totalDrinkingTime[i] = drinkingEndTime[i] - drinkingStartTime[i];
+              isDrinking[i] = false;
+              
+              Serial.println();
+              Serial.println("✅ ═══ สิ้นสุดการดื่มน้ำ ═══");
+              Serial.print("📍 ตำแหน่ง: ");
+              Serial.println(busNames[i]);
+              Serial.print("⏱️  เวลาดื่ม: ");
+              Serial.print(totalDrinkingTime[i] / 1000);
+              Serial.print(".");
+              Serial.print((totalDrinkingTime[i] % 1000) / 100);
+              Serial.println(" วินาที");
+              Serial.print("📏 ระยะทางสุดท้าย: ");
+              Serial.print(distances[i]);
+              Serial.print("mm (ฐาน: ");
+              Serial.print(originalBaseline[i]);
+              Serial.println("mm)");
+              Serial.print("🍶 เซสชั่นการดื่มที่: ");
+              Serial.println(drinkingSession);
+              Serial.println("═══════════════════════════════");
+              Serial.println();
+            }
+          }
+        } else {
+          // ไม่ได้อยู่ในสถานะตรวจจับ ตรวจสอบการเคลื่อนไหวใหม่
+          if (changeFromOriginal > THRESHOLD) {
+            consecutiveChanges[i]++;
+            
+            // ต้องผ่าน cooldown และไม่อยู่ในสถานะตรวจจับ
+            if (consecutiveChanges[i] >= 2 && 
+                (millis() - lastDetection > COOLDOWN) &&
+                !detectionActive[i]) {
+              
+              detectionCount++;
+              drinkingSession++;
+              lastDetection = millis();
+              detectionActive[i] = true;
+              lastActivity[i] = millis();
+              
+              // เริ่มบันทึกเวลาการดื่ม
+              isDrinking[i] = true;
+              drinkingStartTime[i] = millis();
+              
+              Serial.println();
+              Serial.println("🚨 ═══ เริ่มต้นการดื่มน้ำ ═══");
+              Serial.print("📍 ตำแหน่ง: ");
+              Serial.println(busNames[i]);
+              Serial.print("📏 ระยะทางปัจจุบัน: ");
+              Serial.print(distances[i]);
+              Serial.println("mm");
+              Serial.print("📐 ค่าพื้นฐานเดิม: ");
+              Serial.print(originalBaseline[i]);
+              Serial.println("mm");
+              Serial.print("🔄 การเปลี่ยนแปลง: ");
+              Serial.print(changeFromOriginal);
+              Serial.println("mm");
+              
+              // แสดงประเภทการเคลื่อนไหว
+              if (distances[i] < originalBaseline[i]) {
+                Serial.println("🐾 ประเภท: แมวเข้าใกล้น้ำ");
+              } else {
+                Serial.println("🐾 ประเภท: แมวเข้าใกล้น้ำ (ด้านบน)");
+              }
+              
+              Serial.print("🍶 เซสชั่นการดื่มที่: ");
+              Serial.print(drinkingSession);
+              Serial.print(" | เวลาเริ่มต้น: ");
+              Serial.print(millis() / 1000);
+              Serial.println("วินาที");
+              Serial.println("⏰ กำลังบันทึกเวลาการดื่ม...");
+              Serial.println("═══════════════════════════════");
+              Serial.println();
+              
+              consecutiveChanges[i] = 0;
+              break;
+            }
+          } else {
+            consecutiveChanges[i] = 0;
+          }
+        }
+      } else {
+        // ระยะทางน้อยกว่า MIN_DISTANCE - ตรวจจับแบบพิเศษ
+        if (distances[i] < MIN_DISTANCE && originalBaseline[i] > MIN_DISTANCE * 3) {
+          if (!detectionActive[i] && (millis() - lastDetection > COOLDOWN)) {
+            detectionCount++;
+            drinkingSession++;
+            lastDetection = millis();
+            detectionActive[i] = true;
+            lastActivity[i] = millis();
+            
+            // เริ่มบันทึกเวลาการดื่ม
+            isDrinking[i] = true;
+            drinkingStartTime[i] = millis();
+            
+            Serial.println();
+            Serial.println("🚨 ═══ เริ่มดื่มน้ำ (ใกล้มาก) ═══");
+            Serial.print("📍 ตำแหน่ง: ");
+            Serial.println(busNames[i]);
+            Serial.print("📏 ระยะทาง: ");
+            Serial.print(distances[i]);
+            Serial.println("mm (ใกล้มาก!)");
+            Serial.print("📐 ค่าพื้นฐานเดิม: ");
+            Serial.print(originalBaseline[i]);
+            Serial.println("mm");
+            Serial.println("🐾 ประเภท: แมวมาดื่มน้ำใกล้มาก");
+            Serial.print("🍶 เซสชั่นการดื่มที่: ");
+            Serial.print(drinkingSession);
+            Serial.print(" | เวลาเริ่มต้น: ");
+            Serial.print(millis() / 1000);
+            Serial.println("วินาที");
+            Serial.println("⏰ กำลังบันทึกเวลาการดื่ม...");
+            Serial.println("═══════════════════════════════");
+            Serial.println();
+            break;
+          }
+        }
+      }
+      
+      // รีเซ็ต baseline เดิมถ้านานเกินไป (30 นาที)
+      if (millis() - lastActivity[i] > 1800000) {
+        originalBaseline[i] = distances[i];
+        stableDistances[i] = distances[i];
+        detectionActive[i] = false;
+        consecutiveChanges[i] = 0;
+        // รีเซ็ตข้อมูลการดื่มด้วย
+        isDrinking[i] = false;
+        drinkingStartTime[i] = 0;
+        drinkingEndTime[i] = 0;
+        totalDrinkingTime[i] = 0;
+      }
+    }
+  }
+}
+
+void displayResults() {
+  static bool detectionActive[2] = {false, false};  // ต้องเป็น static ให้ตรงกับใน detectMovement
+  
+  Serial.print("📏 [");
+  Serial.print(millis() / 1000);
+  Serial.print("s] ");
+  
+  for (int i = 0; i < 2; i++) {
+    Serial.print(busNames[i]);
+    Serial.print(": ");
+    
+    if (!sensorReady[i]) {
+      Serial.print("OFF");
+    } else if (distances[i] == 0xFFFF) {
+      Serial.print("ERR");
+    } else {
+      Serial.print(distances[i]);
+      Serial.print("mm");
+      
+      // แสดงสถานะการดื่มน้ำ
+      if (isDrinking[i]) {
+        unsigned long currentDrinkingTime = millis() - drinkingStartTime[i];
+        Serial.print("[🍶");
+        Serial.print(currentDrinkingTime / 1000);
+        Serial.print("s]");
+      }
+      
+      // แสดงการเปลี่ยนแปลงจากค่าพื้นฐาน
+      if (stableDistances[i] > 0) {
+        int change = (int16_t)distances[i] - (int16_t)stableDistances[i];
+        Serial.print("(");
+        if (change > 0) Serial.print("+");
+        Serial.print(change);
+        Serial.print(")");
+      }
+    }
+    
+    if (i == 0) Serial.print(" | ");
+  }
+  
+  Serial.print(" | ดื่มน้ำ: ");
+  Serial.print(drinkingSession);
+  Serial.print("ครั้ง");
+  
+  // แสดงเวลาผ่านไปจากการดื่มล่าสุด
+  if (drinkingSession > 0 && lastDetection > 0) {
+    unsigned long secSinceDetection = (millis() - lastDetection) / 1000;
+    Serial.print(" (ล่าสุด: ");
+    Serial.print(secSinceDetection);
+    Serial.print("วิ)");
+  }
+  
+  Serial.println();
+}
+
+// ฟังก์ชันแสดงสถิติการดื่มน้ำโดยรวม
+void displayDrinkingStatistics() {
+  Serial.println();
+  Serial.println("📊 ═══ สถิติการดื่มน้ำ ═══");
+  Serial.print("🍶 จำนวนครั้งทั้งหมด: ");
+  Serial.print(drinkingSession);
+  Serial.println(" ครั้ง");
+  
+  if (drinkingSession > 0) {
+    Serial.println("📈 รายละเอียดแต่ละครั้ง:");
+    
+    // แสดงข้อมูลการดื่มที่เสร็จสิ้นแล้ว
+    unsigned long totalTime = 0;
+    int completedSessions = 0;
+    
+    for (int i = 0; i < 2; i++) {
+      if (totalDrinkingTime[i] > 0) {
+        completedSessions++;
+        totalTime += totalDrinkingTime[i];
+        
+        Serial.print("   ");
+        Serial.print(busNames[i]);
+        Serial.print(": ");
+        Serial.print(totalDrinkingTime[i] / 1000);
+        Serial.print(".");
+        Serial.print((totalDrinkingTime[i] % 1000) / 100);
+        Serial.println(" วินาที");
+      }
+      
+      // แสดงเซสชั่นที่กำลังดำเนินอยู่
+      if (isDrinking[i]) {
+        unsigned long currentTime = millis() - drinkingStartTime[i];
+        Serial.print("   ");
+        Serial.print(busNames[i]);
+        Serial.print(": กำลังดื่ม... (");
+        Serial.print(currentTime / 1000);
+        Serial.print(".");
+        Serial.print((currentTime % 1000) / 100);
+        Serial.println(" วินาที)");
+      }
+    }
+    
+    if (completedSessions > 0) {
+      Serial.print("⌛ เวลาเฉลี่ยต่อครั้ง: ");
+      Serial.print((totalTime / completedSessions) / 1000);
+      Serial.print(".");
+      Serial.print(((totalTime / completedSessions) % 1000) / 100);
+      Serial.println(" วินาที");
+    }
+    
+    // แสดงเวลาการดื่มล่าสุด
+    unsigned long timeSinceLastDrink = (millis() - lastDetection) / 1000;
+    Serial.print("🕐 เวลาผ่านไปจากครั้งล่าสุด: ");
+    Serial.print(timeSinceLastDrink / 60);
+    Serial.print(" นาที ");
+    Serial.print(timeSinceLastDrink % 60);
+    Serial.println(" วินาที");
+  }
+  
+  Serial.println("═══════════════════════════════");
+  Serial.println();
+}
