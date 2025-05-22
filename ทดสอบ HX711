@@ -1,0 +1,367 @@
+// HX711 Smart Baseline Management System
+// แก้ปัญหาการเติมน้ำและการระเหย
+
+#include "HX711.h"
+
+#define LOADCELL_DOUT_PIN  4
+#define LOADCELL_SCK_PIN   3
+
+HX711 scale;
+float calibrationFactor = -369.726624; // ค่าที่ calibrate ได้
+
+// ระบบจัดการ Baseline อัจฉริยะ
+struct WaterBaseline {
+    float emptyBowlWeight;        // น้ำหนักชามเปล่า
+    float fullWaterWeight;        // น้ำหนักน้ำเต็ม (หลังเติมน้ำ)
+    float currentWeight;          // น้ำหนักปัจจุบัน
+    float waterConsumed;          // น้ำที่ดื่มไปแล้ว
+    float evaporationRate;        // อัตราการระเหย (g/hour)
+    
+    unsigned long lastUpdateTime;     // เวลาอัพเดทล่าสุด
+    unsigned long lastRefillTime;     // เวลาเติมน้ำล่าสุด
+    unsigned long lastEvapCheckTime;  // เวลาตรวจสอบการระเหยล่าสุด
+    
+    bool needsRecalibration;      // ต้องปรับ baseline หรือไม่
+    bool autoEvaporationMode;     // โหมดชดเชยการระเหยอัตโนมัติ
+};
+
+WaterBaseline waterSystem;
+
+// ค่าคงที่
+#define REFILL_THRESHOLD 50.0f         // น้ำหนักเพิ่มขึ้น 50g = เติมน้ำ
+#define EVAPORATION_CHECK_INTERVAL 3600000UL  // ตรวจสอบการระเหยทุก 1 ชั่วโมง
+#define MAX_EVAPORATION_RATE 2.0f      // การระเหยสูงสุด 2g/hour
+#define MIN_WATER_CHANGE 0.5f          // การเปลี่ยนแปลงขั้นต่ำที่นับ
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n=== HX711 Smart Baseline System ===");
+    
+    // เริ่มต้น HX711
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    delay(2000);
+    
+    if (!scale.is_ready()) {
+        Serial.println("❌ HX711 ไม่พร้อม!");
+        return;
+    }
+    
+    scale.set_scale(calibrationFactor);
+    scale.tare(20);
+    
+    // เริ่มต้นระบบ
+    initWaterSystem();
+    
+    Serial.println("\n=== คำสั่งที่ใช้ได้ ===");
+    Serial.println("'setup' - ตั้งค่าระบบใหม่");
+    Serial.println("'refill' - แจ้งเติมน้ำ");
+    Serial.println("'status' - ดูสถานะปัจจุบัน");
+    Serial.println("'auto' - เปิด/ปิดโหมดอัตโนมัติ");
+    Serial.println("'reset' - รีเซ็ตระบบ");
+    Serial.println("'test' - ทดสอบการทำงาน");
+}
+
+void loop() {
+    updateWaterSystem();
+    
+    if (Serial.available()) {
+        String cmd = Serial.readString();
+        cmd.trim();
+        cmd.toLowerCase();
+        
+        if (cmd == "setup") {
+            setupWaterSystem();
+        }
+        else if (cmd == "refill") {
+            handleRefill();
+        }
+        else if (cmd == "status") {
+            showStatus();
+        }
+        else if (cmd == "auto") {
+            toggleAutoMode();
+        }
+        else if (cmd == "reset") {
+            resetSystem();
+        }
+        else if (cmd == "test") {
+            testSystem();
+        }
+        else {
+            Serial.println("คำสั่งไม่ถูกต้อง!");
+        }
+    }
+    
+    delay(1000);
+}
+
+void initWaterSystem() {
+    Serial.println("เริ่มต้นระบบจัดการน้ำ...");
+    
+    waterSystem.emptyBowlWeight = 0.0;
+    waterSystem.fullWaterWeight = 0.0;
+    waterSystem.currentWeight = 0.0;
+    waterSystem.waterConsumed = 0.0;
+    waterSystem.evaporationRate = 0.5; // เริ่มต้น 0.5g/hour
+    
+    waterSystem.lastUpdateTime = millis();
+    waterSystem.lastRefillTime = millis();
+    waterSystem.lastEvapCheckTime = millis();
+    
+    waterSystem.needsRecalibration = true;
+    waterSystem.autoEvaporationMode = true;
+    
+    Serial.println("✅ ระบบเริ่มต้นเสร็จสิ้น");
+}
+
+void setupWaterSystem() {
+    Serial.println("\n=== ตั้งค่าระบบน้ำ ===");
+    
+    // ขั้นตอนที่ 1: ชามเปล่า
+    Serial.println("ขั้นที่ 1: เอาน้ำออกจากชามให้หมด");
+    Serial.println("พิมพ์ 'ok' เมื่อชามเปล่าแล้ว:");
+    
+    while(true) {
+        if(Serial.available()) {
+            String input = Serial.readString();
+            input.trim();
+            input.toLowerCase();
+            if(input == "ok") break;
+        }
+        delay(100);
+    }
+    
+    delay(2000);
+    waterSystem.emptyBowlWeight = scale.get_units(10);
+    Serial.println("น้ำหนักชามเปล่า: " + String(waterSystem.emptyBowlWeight, 2) + "g");
+    
+    // ขั้นตอนที่ 2: เติมน้ำเต็ม
+    Serial.println("\nขั้นที่ 2: เติมน้ำเต็มชาม");
+    Serial.println("พิมพ์ 'ok' เมื่อเติมน้ำเต็มแล้ว:");
+    
+    while(true) {
+        if(Serial.available()) {
+            String input = Serial.readString();
+            input.trim();
+            input.toLowerCase();
+            if(input == "ok") break;
+        }
+        delay(100);
+    }
+    
+    delay(2000);
+    waterSystem.fullWaterWeight = scale.get_units(10);
+    waterSystem.currentWeight = waterSystem.fullWaterWeight;
+    
+    Serial.println("น้ำหนักน้ำเต็ม: " + String(waterSystem.fullWaterWeight, 2) + "g");
+    Serial.println("ปริมาณน้ำ: " + String(waterSystem.fullWaterWeight - waterSystem.emptyBowlWeight, 2) + "g");
+    
+    // รีเซ็ตค่าต่างๆ
+    waterSystem.waterConsumed = 0.0;
+    waterSystem.lastRefillTime = millis();
+    waterSystem.lastEvapCheckTime = millis();
+    waterSystem.needsRecalibration = false;
+    
+    Serial.println("✅ ตั้งค่าระบบเสร็จสิ้น!");
+}
+
+void updateWaterSystem() {
+    unsigned long currentTime = millis();
+    
+    // อ่านน้ำหนักปัจจุบัน
+    float newWeight = scale.get_units(3);
+    
+    // กรองค่าผิดปกติ
+    if (abs(newWeight - waterSystem.currentWeight) > 200) {
+        Serial.println("⚠️ น้ำหนักเปลี่ยนแปลงมาก: " + String(newWeight, 2) + "g");
+        return; // ข้ามการอัพเดทครั้งนี้
+    }
+    
+    waterSystem.currentWeight = newWeight;
+    
+    // ตรวจสอบการเติมน้ำอัตโนมัติ
+    if (waterSystem.autoEvaporationMode) {
+        checkAutoRefill();
+    }
+    
+    // ชดเชยการระเหย
+    if (currentTime - waterSystem.lastEvapCheckTime > EVAPORATION_CHECK_INTERVAL) {
+        compensateEvaporation();
+        waterSystem.lastEvapCheckTime = currentTime;
+    }
+    
+    // คำนวณน้ำที่ดื่มไป
+    calculateWaterConsumption();
+    
+    waterSystem.lastUpdateTime = currentTime;
+}
+
+void checkAutoRefill() {
+    float weightIncrease = waterSystem.currentWeight - waterSystem.fullWaterWeight;
+    
+    // ถ้าน้ำหนักเพิ่มขึ้นมากกว่า threshold = เติมน้ำใหม่
+    if (weightIncrease > REFILL_THRESHOLD) {
+        Serial.println("\n🔄 ตรวจพบการเติมน้ำอัตโนมัติ!");
+        Serial.println("น้ำหนักเพิ่มขึ้น: " + String(weightIncrease, 2) + "g");
+        
+        // อัพเดท baseline ใหม่
+        waterSystem.fullWaterWeight = waterSystem.currentWeight;
+        waterSystem.lastRefillTime = millis();
+        waterSystem.waterConsumed = 0.0; // รีเซ็ตการนับ
+        
+        Serial.println("✅ อัพเดท baseline ใหม่: " + String(waterSystem.fullWaterWeight, 2) + "g");
+    }
+}
+
+void compensateEvaporation() {
+    unsigned long timeElapsed = millis() - waterSystem.lastEvapCheckTime;
+    float hoursElapsed = timeElapsed / 3600000.0; // แปลงเป็นชั่วโมง
+    
+    float evaporationAmount = waterSystem.evaporationRate * hoursElapsed;
+    
+    if (evaporationAmount > 0.1) { // ถ้าระเหยมากกว่า 0.1g
+        Serial.println("💨 ชดเชยการระเหย: " + String(evaporationAmount, 2) + "g");
+        
+        // ปรับ baseline ให้ต่ำลง (เพราะน้ำระเหย)
+        waterSystem.fullWaterWeight -= evaporationAmount;
+        
+        // ปรับอัตราการระเหยตามสภาพแวดล้อม
+        updateEvaporationRate();
+    }
+}
+
+void updateEvaporationRate() {
+    // คำนวณอัตราการระเหยจากข้อมูลจริง
+    unsigned long timeSinceRefill = millis() - waterSystem.lastRefillTime;
+    float hoursSinceRefill = timeSinceRefill / 3600000.0;
+    
+    if (hoursSinceRefill > 1.0) {
+        float totalEvaporation = waterSystem.fullWaterWeight - waterSystem.currentWeight + waterSystem.waterConsumed;
+        float estimatedEvapRate = totalEvaporation / hoursSinceRefill;
+        
+        // ปรับอัตราการระเหยแบบ smooth
+        if (estimatedEvapRate > 0 && estimatedEvapRate < MAX_EVAPORATION_RATE) {
+            waterSystem.evaporationRate = (waterSystem.evaporationRate * 0.8) + (estimatedEvapRate * 0.2);
+        }
+    }
+}
+
+void calculateWaterConsumption() {
+    // คำนวณน้ำที่ดื่มไป = น้ำเต็ม - น้ำปัจจุบัน - การระเหย
+    float rawConsumption = waterSystem.fullWaterWeight - waterSystem.currentWeight;
+    
+    // ลบการระเหยออก
+    unsigned long timeSinceRefill = millis() - waterSystem.lastRefillTime;
+    float hoursElapsed = timeSinceRefill / 3600000.0;
+    float evaporationAmount = waterSystem.evaporationRate * hoursElapsed;
+    
+    waterSystem.waterConsumed = rawConsumption - evaporationAmount;
+    
+    // ป้องกันค่าติดลบ
+    if (waterSystem.waterConsumed < 0) {
+        waterSystem.waterConsumed = 0;
+    }
+}
+
+void handleRefill() {
+    Serial.println("\n🚰 การเติมน้ำแบบแมนนวล");
+    Serial.println("เติมน้ำเต็มชามแล้วพิมพ์ 'ok':");
+    
+    while(true) {
+        if(Serial.available()) {
+            String input = Serial.readString();
+            input.trim();
+            input.toLowerCase();
+            if(input == "ok") break;
+        }
+        delay(100);
+    }
+    
+    delay(2000);
+    float newFullWeight = scale.get_units(10);
+    
+    Serial.println("น้ำหนักก่อนเติม: " + String(waterSystem.fullWaterWeight, 2) + "g");
+    Serial.println("น้ำหนักหลังเติม: " + String(newFullWeight, 2) + "g");
+    Serial.println("น้ำที่เติม: " + String(newFullWeight - waterSystem.currentWeight, 2) + "g");
+    
+    // อัพเดทค่าใหม่
+    waterSystem.fullWaterWeight = newFullWeight;
+    waterSystem.currentWeight = newFullWeight;
+    waterSystem.lastRefillTime = millis();
+    waterSystem.waterConsumed = 0.0;
+    
+    Serial.println("✅ อัพเดทข้อมูลการเติมน้ำเสร็จสิ้น!");
+}
+
+void showStatus() {
+    Serial.println("\n=== สถานะระบบน้ำ ===");
+    Serial.println("น้ำหนักชามเปล่า: " + String(waterSystem.emptyBowlWeight, 2) + "g");
+    Serial.println("น้ำหนักน้ำเต็ม: " + String(waterSystem.fullWaterWeight, 2) + "g");
+    Serial.println("น้ำหนักปัจจุบัน: " + String(waterSystem.currentWeight, 2) + "g");
+    Serial.println("น้ำที่ดื่มไป: " + String(waterSystem.waterConsumed, 2) + "g");
+    Serial.println("อัตราการระเหย: " + String(waterSystem.evaporationRate, 2) + "g/hour");
+    
+    unsigned long timeSinceRefill = millis() - waterSystem.lastRefillTime;
+    Serial.println("เวลาตั้งแต่เติมน้ำ: " + String(timeSinceRefill / 3600000.0, 1) + " ชั่วโมง");
+    
+    Serial.println("โหมดอัตโนมัติ: " + String(waterSystem.autoEvaporationMode ? "เปิด" : "ปิด"));
+    
+    // คำนวณเปอร์เซ็นต์น้ำที่เหลือ
+    float waterRemaining = waterSystem.fullWaterWeight - waterSystem.emptyBowlWeight - waterSystem.waterConsumed;
+    float totalWater = waterSystem.fullWaterWeight - waterSystem.emptyBowlWeight;
+    float percentRemaining = (waterRemaining / totalWater) * 100;
+    
+    Serial.println("น้ำคงเหลือ: " + String(percentRemaining, 1) + "%");
+    Serial.println("======================");
+}
+
+void toggleAutoMode() {
+    waterSystem.autoEvaporationMode = !waterSystem.autoEvaporationMode;
+    Serial.println("โหมดอัตโนมัติ: " + String(waterSystem.autoEvaporationMode ? "เปิด" : "ปิด"));
+}
+
+void resetSystem() {
+    Serial.println("รีเซ็ตระบบ...");
+    initWaterSystem();
+    Serial.println("✅ รีเซ็ตเสร็จสิ้น - ใช้คำสั่ง 'setup' เพื่อตั้งค่าใหม่");
+}
+
+void testSystem() {
+    Serial.println("\n=== ทดสอบระบบ ===");
+    
+    for (int i = 0; i < 10; i++) {
+        updateWaterSystem();
+        
+        Serial.printf("Test %d: Weight=%.2fg, Consumed=%.2fg, Evap=%.3fg/h\n", 
+                     i+1, waterSystem.currentWeight, waterSystem.waterConsumed, waterSystem.evaporationRate);
+        
+        delay(1000);
+    }
+    
+    Serial.println("=== ทดสอบเสร็จสิ้น ===");
+}
+
+// ฟังก์ชันสำหรับใช้ในโค้ดหลัก
+bool isRealDrinking(float sessionDuration, float weightChange) {
+    // ตรวจสอบว่าเป็นการดื่มน้ำจริงหรือไม่
+    bool timeOK = sessionDuration >= 1.0; // อย่างน้อย 1 วินาที
+    bool weightOK = weightChange >= MIN_WATER_CHANGE; // น้ำหนักเปลี่ยนแปลงจริง
+    bool reasonableAmount = weightChange <= 50.0; // ไม่เกิน 50g ต่อครั้ง
+    
+    return timeOK && weightOK && reasonableAmount;
+}
+
+float getCurrentWaterConsumption() {
+    return waterSystem.waterConsumed;
+}
+
+void notifyRefill() {
+    // แจ้งเตือนเมื่อต้องเติมน้ำ
+    float waterRemaining = waterSystem.fullWaterWeight - waterSystem.emptyBowlWeight - waterSystem.waterConsumed;
+    float totalWater = waterSystem.fullWaterWeight - waterSystem.emptyBowlWeight;
+    float percentRemaining = (waterRemaining / totalWater) * 100;
+    
+    if (percentRemaining < 20) {
+        Serial.println("⚠️ น้ำเหลือน้อย! (" + String(percentRemaining, 1) + "%)");
+    }
+}
