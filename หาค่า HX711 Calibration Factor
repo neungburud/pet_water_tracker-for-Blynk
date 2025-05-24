@@ -1,0 +1,153 @@
+// HX711 Calibration Factor Finder
+// หาค่า Calibration Factor สำหรับ Load Cell
+
+#include "HX711.h"
+
+#define LOADCELL_DOUT_PIN  2
+#define LOADCELL_SCK_PIN   3
+
+HX711 scale;
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n=== HX711 Calibration Factor Finder ===");
+    
+    // เริ่มต้น HX711
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    delay(2000);
+    
+    if (!scale.is_ready()) {
+        Serial.println("❌ HX711 ไม่พร้อม!");
+        while(1);
+    }
+    
+    Serial.println("✅ HX711 พร้อมใช้งาน");
+    
+    // ตั้งค่าเริ่มต้น
+    scale.set_scale();
+    scale.tare(20);  // Tare โดยใช้ค่าเฉลี่ย 20 ครั้ง
+    
+    Serial.println("\n=== ขั้นตอนการ Calibration ===");
+    Serial.println("1. วางน้ำหนักมาตรฐาน (เช่น 100g, 500g, 1000g)");
+    Serial.println("2. พิมพ์น้ำหนักที่วาง เช่น '100' สำหรับ 100 กรัม");
+    Serial.println("3. ระบบจะคำนวณ Calibration Factor ให้");
+    Serial.println("4. พิมพ์ 'test' เพื่อทดสอบความแม่นยำ");
+    Serial.println("5. พิมพ์ 'reset' เพื่อ Tare ใหม่");
+    Serial.println("\nพร้อมแล้ว! วางน้ำหนักมาตรฐานแล้วพิมพ์น้ำหนัก:");
+}
+
+void loop() {
+    if (Serial.available()) {
+        String input = Serial.readString();
+        input.trim();
+        
+        if (input == "test") {
+            testCalibration();
+        }
+        else if (input == "reset") {
+            resetTare();
+        }
+        else {
+            float knownWeight = input.toFloat();
+            if (knownWeight > 0) {
+                calculateCalibrationFactor(knownWeight);
+            } else {
+                Serial.println("❌ กรุณาป้อนน้ำหนักที่ถูกต้อง (ตัวเลขเท่านั้น)");
+            }
+        }
+    }
+    
+    // แสดงค่า Raw reading ต่อเนื่อง
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint > 1000) {
+        long rawReading = scale.get_units();
+        Serial.println("Raw reading: " + String(rawReading));
+        lastPrint = millis();
+    }
+}
+
+void calculateCalibrationFactor(float knownWeight) {
+    Serial.println("\n🔄 กำลังคำนวณ Calibration Factor...");
+    Serial.println("น้ำหนักมาตรฐาน: " + String(knownWeight, 2) + "g");
+    
+    // อ่านค่า Raw จาก HX711 หลายครั้งเพื่อความแม่นยำ
+    Serial.println("กำลังอ่านค่า... (รอสักครู่)");
+    
+    long rawReading = 0;
+    int numReadings = 20;
+    
+    for (int i = 0; i < numReadings; i++) {
+        rawReading += scale.get_units();
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+    
+    rawReading = rawReading / numReadings; // หาค่าเฉลี่ย
+    
+    // คำนวณ Calibration Factor
+    float calibrationFactor = (float)rawReading / knownWeight;
+    
+    Serial.println("\n=== ผลการคำนวณ ===");
+    Serial.println("Raw Reading (เฉลี่ย): " + String(rawReading));
+    Serial.println("น้ำหนักมาตรฐาน: " + String(knownWeight, 2) + "g");
+    Serial.println("Calibration Factor: " + String(calibrationFactor, 6));
+    
+    // ทดสอบทันทีด้วยค่าที่คำนวณได้
+    scale.set_scale(calibrationFactor);
+    delay(1000);
+    
+    float measuredWeight = scale.get_units(10);
+    float error = abs(measuredWeight - knownWeight);
+    float errorPercent = (error / knownWeight) * 100;
+    
+    Serial.println("\n=== การทดสอบทันที ===");
+    Serial.println("น้ำหนักที่วัดได้: " + String(measuredWeight, 2) + "g");
+    Serial.println("ความผิดพลาด: " + String(error, 2) + "g (" + String(errorPercent, 1) + "%)");
+    
+    if (errorPercent < 2.0) {
+        Serial.println("✅ ความแม่นยำดีมาก! (< 2%)");
+    } else if (errorPercent < 5.0) {
+        Serial.println("⚠️ ความแม่นยำพอใช้ (2-5%)");
+    } else {
+        Serial.println("❌ ความแม่นยำต่ำ (> 5%) - ลองใช้น้ำหนักมาตรฐานอื่น");
+    }
+    
+    Serial.println("\n📋 Copy โค้ดนี้ไปใช้:");
+    Serial.println("float calibrationFactor = " + String(calibrationFactor, 6) + ";");
+    Serial.println("scale.set_scale(calibrationFactor);");
+    
+    Serial.println("\nพิมพ์น้ำหนักมาตรฐานอื่นเพื่อทดสอบเพิ่มเติม หรือ 'test' เพื่อทดสอบต่อเนื่อง");
+}
+
+void testCalibration() {
+    Serial.println("\n=== โหมดทดสอบต่อเนื่อง ===");
+    Serial.println("วางน้ำหนักต่างๆ แล้วดูผล (พิมพ์อะไรก็ได้เพื่อหยุด)");
+    
+    while (!Serial.available()) {
+        float weight = scale.get_units(5);
+        Serial.println("น้ำหนักปัจจุบัน: " + String(weight, 2) + "g");
+        delay(1000);
+    }
+    
+    // อ่านข้อมูลที่เหลือใน buffer
+    while (Serial.available()) {
+        Serial.read();
+    }
+    
+    Serial.println("หยุดการทดสอบแล้ว");
+    Serial.println("พิมพ์น้ำหนักมาตรฐานเพื่อ calibrate ใหม่:");
+}
+
+void resetTare() {
+    Serial.println("\n🔄 กำลัง Tare ใหม่...");
+    Serial.println("เอาของออกจาก Load Cell ให้หมด");
+    Serial.println("รอ 3 วินาที...");
+    
+    delay(3000);
+    
+    scale.tare(20);
+    
+    Serial.println("✅ Tare เสร็จสิ้น");
+    Serial.println("วางน้ำหนักมาตรฐานแล้วพิมพ์น้ำหนัก:");
+}
