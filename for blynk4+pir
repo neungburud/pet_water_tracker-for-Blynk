@@ -1,13 +1,14 @@
 // src/main.cpp
 // Pet Water Tracker - อัปเดต: OLED แสดงผลภาษาอังกฤษ, ชื่อสัตว์เลี้ยง EN, Font artossans8_8r
+// ใช้ NimBLE-Arduino @ 1.3.8 และแก้ไข performBLEScan ให้สอดคล้อง
 
 // --- PlatformIO Dependencies (ตัวอย่างสำหรับ platformio.ini) ---
 // lib_deps =
-//     h2zero/NimBLE-Arduino
-//     blynkkk/Blynk
-//     bblanchon/ArduinoJson
-//     paulstoffregen/Time
-//     olikraus/U8g2
+//      h2zero/NimBLE-Arduino @ 1.3.8  // <--- ระบุเวอร์ชัน
+//      blynkkk/Blynk
+//      bblanchon/ArduinoJson
+//      paulstoffregen/Time
+//      olikraus/U8g2
 
 #define BLYNK_TEMPLATE_ID "TMPL6NoF0TqpZ"
 #define BLYNK_TEMPLATE_NAME "PetWaterTracker"
@@ -16,7 +17,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <BlynkSimpleEsp32.h>
-#include <NimBLEDevice.h>
+#include <NimBLEDevice.h> // For NimBLE
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <TimeLib.h>
@@ -31,7 +32,7 @@
 
 // --- Virtual Pin Definitions ---
 #define VPIN_PET1_DURATION V1
-#define VPIN_PET1_NAME V2       // จะยังคงส่งชื่อภาษาไทยไป Blynk ถ้า sync จาก pets[i].name
+#define VPIN_PET1_NAME V2
 #define VPIN_PET1_COUNT V3
 #define VPIN_PET1_LAST_TIME V7
 #define VPIN_PET1_LAST_DATE V20
@@ -57,33 +58,32 @@
 #define VPIN_HEARTBEAT V0
 
 // --- LED RGB KY-016 Pin Definitions ---
-#define LED_RED_PIN   27
+#define LED_RED_PIN     27
 #define LED_GREEN_PIN 26
 #define LED_BLUE_PIN  25
 
 // --- OLED Display Setup ---
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-// หรือ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-const uint8_t* oledFont = u8g2_font_artossans8_8r; // Font ที่เลือก
+const uint8_t* oledFont = u8g2_font_artossans8_8r;
 
 // Decision Constants
-int RSSI_ENTER_THRESHOLD = -60;
+int RSSI_ENTER_THRESHOLD = -70;
 #define RSSI_STRONG_SIGNAL_THRESHOLD -80
-#define RSSI_EXIT_THRESHOLD -65
-#define MIN_DRINKING_TIME_SEC 1.0f
+#define RSSI_EXIT_THRESHOLD -71
+#define MIN_DRINKING_TIME_SEC 2.0f
 #define MOVEMENT_THRESHOLD 5
 #define MAX_HISTORY_RECORDS 100
 #define RECONNECT_INTERVAL 30000
 #define PRESENCE_CONFIRMATION_SCANS 2
 #define PRESENCE_CONFIRMATION_SCANS_PIR 1
 #define MAX_STATIONARY_DURATION_MS 180000UL
-#define MAX_CONSECUTIVE_MISSES 3
-#define MIN_SESSION_GAP_MS 3000
+#define MAX_CONSECUTIVE_MISSES 4
+#define MIN_SESSION_GAP_MS 10000
 unsigned long lastSessionEndTime = 0;
 
 // PIR Sensor config
 #define PIR_PIN 23
-unsigned long PIR_MAX_GAP_MS = 5000;
+unsigned long PIR_MAX_GAP_MS = 2000;
 unsigned long PIR_DEBOUNCE_MS = 500;
 volatile bool pirTriggered = false;
 volatile unsigned long lastPirTriggerTime = 0;
@@ -94,7 +94,7 @@ int systemMode = 2;
 int pirSensitivity = 3;
 
 // WiFi & Blynk Credentials
-const char* ssid = "edimax_2.4G"; // << แก้ไข WiFi SSID ของคุณ
+const char* ssid = "edimax_2.4G";     // << แก้ไข WiFi SSID ของคุณ
 const char* password = "0645064615";  // << แก้ไข WiFi Password ของคุณ
 const char* auth = "cKT_nZGxgiEljvBknay0OlpHqyu2Yv4n"; // << แก้ไข Blynk Auth Token ของคุณ
 
@@ -106,19 +106,19 @@ const long gmtOffset_sec = 7 * 3600;
 const int daylightOffset_sec = 0;
 
 // BLE
-NimBLEScan* pBLEScan;
-const int BLE_SCAN_DURATION_SEC = 1;
-int scanInterval = 1000;
+NimBLEScan* pBLEScan; // Global pBLEScan object
+const int BLE_SCAN_DURATION_SEC = 1; // Scan duration in seconds
+int scanInterval = 1000; // Default scan interval
 unsigned long lastScanTime = 0;
 
 // Debug
-bool showDetailedBLEScan = false;
+bool showDetailedBLEScan = true; // ตั้งเป็น true เพื่อดู log BLE ที่ละเอียดขึ้น
 bool lastScanHadActivity = false;
 
-// Pet State Structure (เพิ่ม name_en)
+// Pet State Structure
 struct PetState {
-    const char* name;         // ชื่อภาษาไทย (สำหรับ Blynk, Serial Monitor)
-    const char* name_en;      // ชื่อภาษาอังกฤษ (สำหรับ OLED)
+    const char* name;
+    const char* name_en;
     const char* targetName;
     const char* targetMAC;
     int rssiBuffer[10]; float filteredRSSI; bool isNearby;
@@ -138,7 +138,7 @@ PetState pets[3] = {
 };
 int activePetIndex = -1;
 
-// Global variables (เหมือนเดิม)
+// Global variables
 unsigned long lastResetTimeMillis = 0;
 unsigned long lastReconnectAttempt = 0;
 unsigned long lastHeartbeatTime = 0;
@@ -160,8 +160,8 @@ struct PetScanData { bool foundThisScan; int avgRSSI; bool isMoving; int petInde
 unsigned long blueLedStartTime = 0;
 const unsigned long blueLedDuration = 3000;
 bool blueLedActive = false;
-bool strongBleSignalDetected = false;
-bool generalRecentBleActivity = false; // สำหรับ log และ debug ทั่วไป
+bool strongBleSignalDetected = false; // For LED logic if needed, or general state
+bool generalRecentBleActivity = false;
 
 // --- Global variables for OLED update ---
 unsigned long lastOledUpdateTime = 0;
@@ -169,8 +169,8 @@ const unsigned long oledUpdateInterval = 1000;
 int previousActivePetIndex_oled = -1;
 int previousPetCounts_oled[3] = {-1, -1, -1};
 
+
 // --- FUNCTION PROTOTYPES ---
-// (ส่วนใหญ่เหมือนเดิม)
 void initNTP();
 void connectWiFi();
 void connectBlynk();
@@ -182,7 +182,7 @@ void performBLEScan();
 void processPirState();
 void IRAM_ATTR pirInterruptHandler();
 void processScannedPet(int petIndex, bool isPrimaryCandidate, bool wasPetFoundInScan, int scannedAvgRSSI, bool scannedIsMoving);
-bool calculateMovement(int* rssiBuffer); // แก้ไขให้ return bool
+bool calculateMovement(int* rssiBuffer);
 void updateRSSIBufferAndFilter(int petIndex, int newRSSI);
 void sendToBlynkPetData(int petIndex, float duration);
 void syncAllDataToBlynk();
@@ -208,7 +208,7 @@ void updateOledDisplay();
 
 
 // --- LED FUNCTION IMPLEMENTATIONS ---
-void setLedColor(int redVal, int greenVal, int blueVal) { /* ... เหมือนเดิม ... */ 
+void setLedColor(int redVal, int greenVal, int blueVal) {
     digitalWrite(LED_RED_PIN, redVal);
     digitalWrite(LED_GREEN_PIN, greenVal);
     digitalWrite(LED_BLUE_PIN, blueVal);
@@ -218,7 +218,7 @@ void ledRed() { setLedColor(HIGH, LOW, LOW); }
 void ledGreen() { setLedColor(LOW, HIGH, LOW); }
 void ledBlue() { setLedColor(LOW, LOW, HIGH); }
 
-void setupLed() { /* ... เหมือนเดิม ... */ 
+void setupLed() {
     pinMode(LED_RED_PIN, OUTPUT);
     pinMode(LED_GREEN_PIN, OUTPUT);
     pinMode(LED_BLUE_PIN, OUTPUT);
@@ -226,35 +226,39 @@ void setupLed() { /* ... เหมือนเดิม ... */
     Serial.println("LED: RGB LED Initialized.");
 }
 
-void handleLedIndicators() { /* ... เหมือนเดิม (Logic LED ใหม่) ... */ 
+void handleLedIndicators() {
     if (blueLedActive) {
         if (millis() - blueLedStartTime < blueLedDuration) {
             ledBlue();
-            return; 
+            return;
         } else {
-            blueLedActive = false; 
+            blueLedActive = false;
         }
     }
 
     if (activePetIndex != -1) { // สัตว์เลี้ยงกำลังดื่มน้ำ (PIR+BLE ทำงานแล้ว)
         ledGreen();
-    } else if (strongBleSignalDetected) { // สัญญาณ BLE แรง แต่ยังไม่มีใครดื่ม
+    } else if (pirTriggered) { // PIR ทำงาน แต่ยังไม่มีสัตว์เลี้ยงดื่ม
         ledRed();
-    } else {
+    }
+    // Removed strongBleSignalDetected for red LED to simplify based on new request
+    // else if (strongBleSignalDetected) { // สัญญาณ BLE แรง แต่ยังไม่มีใครดื่ม
+    //    ledRed();
+    // }
+    else {
         ledOff();
     }
 }
 
-// --- OLED FUNCTION IMPLEMENTATIONS (ใช้ภาษาอังกฤษ และ name_en) ---
+// --- OLED FUNCTION IMPLEMENTATIONS ---
 void setupOled() {
     if (u8g2.begin()) {
         Serial.println("OLED: Begin successful.");
-        // u8g2.enableUTF8Print(); // ไม่จำเป็นถ้าข้อความเป็น ASCII เท่านั้น
-        u8g2.setFontMode(1);    // โหมด Transparent
-        u8g2.setFont(oledFont); // u8g2_font_artossans8_8r
+        u8g2.setFontMode(1);
+        u8g2.setFont(oledFont);
         u8g2.clearBuffer();
         u8g2.setCursor(0, u8g2.getAscent());
-        u8g2.print(F("Starting...")); // ข้อความเริ่มต้นเป็นภาษาอังกฤษ
+        u8g2.print(F("Starting..."));
         u8g2.sendBuffer();
         delay(1500);
         Serial.println("OLED: Initialized.");
@@ -265,14 +269,14 @@ void setupOled() {
 
 void updateOledDisplay() {
     u8g2.clearBuffer();
-    u8g2.setFont(oledFont); // u8g2_font_artossans8_8r
+    u8g2.setFont(oledFont);
 
     String line1 = "", line2 = "", line3 = "", line4 = "";
     int yPos = u8g2.getAscent();
     int lineHeight = u8g2.getMaxCharHeight() + 2;
 
     if (activePetIndex != -1) {
-        line1 = pets[activePetIndex].name_en; // ใช้ชื่อภาษาอังกฤษ
+        line1 = pets[activePetIndex].name_en;
         line2 = F("is drinking");
     } else {
         line1 = F("Daily Counts:");
@@ -291,8 +295,7 @@ void updateOledDisplay() {
 
 
 // --- CORE FUNCTION IMPLEMENTATIONS ---
-// (initializePetStates, IRAM_ATTR pirInterruptHandler, initNTP, setupBLE, setupPIR เหมือนเดิม)
-void initializePetStates() { /* ... เหมือนเดิม ... */ 
+void initializePetStates() {
     for(int i=0; i<3; ++i) {
         for(int j=0; j<10; ++j) pets[i].rssiBuffer[j] = -100;
         pets[i].filteredRSSI = -100.0f;
@@ -307,20 +310,20 @@ void initializePetStates() { /* ... เหมือนเดิม ... */
     activePetIndex = -1;
 }
 
-void IRAM_ATTR pirInterruptHandler() { /* ... เหมือนเดิม ... */ 
+void IRAM_ATTR pirInterruptHandler() {
     unsigned long currentTime = millis();
     if (currentTime - lastPirTriggerTime > PIR_DEBOUNCE_MS) {
-        pirTriggered = true; 
+        pirTriggered = true; // Set the flag to be processed in the main loop
         lastPirTriggerTime = currentTime;
     }
 }
 
-void initNTP() { /* ... เหมือนเดิม ... */ 
+void initNTP() {
     Serial.println("NTP: Initializing...");
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2, ntpServer3);
     Serial.print("NTP: Waiting for system time synchronization");
     struct tm timeinfo; int retries = 0;
-    while ((!getLocalTime(&timeinfo, 1000) || timeinfo.tm_year < (2024 - 1900)) && retries < 15) { Serial.print("."); delay(100); retries++; } 
+    while ((!getLocalTime(&timeinfo, 1000) || timeinfo.tm_year < (2024 - 1900)) && retries < 15) { Serial.print("."); delay(100); retries++; }
     Serial.println();
     if (timeinfo.tm_year < (2024 - 1900)) Serial.println("NTP: Failed to obtain valid system time.");
     else {
@@ -334,20 +337,21 @@ void initNTP() { /* ... เหมือนเดิม ... */
     }
 }
 
-void setupBLE() { /* ... เหมือนเดิม ... */ 
+void setupBLE() {
     Serial.println("BLE: Initializing NimBLE...");
-    NimBLEDevice::init("");
-    pBLEScan = NimBLEDevice::getScan();
+    NimBLEDevice::init(""); // Initialize NimBLE
+    pBLEScan = NimBLEDevice::getScan(); //Create new scan
     if (pBLEScan != nullptr) {
-        pBLEScan->setActiveScan(true);
-        pBLEScan->setInterval(100);
-        pBLEScan->setWindow(99);
-        pBLEScan->setDuplicateFilter(false); 
+        pBLEScan->setActiveScan(true); // Active scan uses more power, but gets results faster
+        pBLEScan->setInterval(100);    // Scan interval in ms
+        pBLEScan->setWindow(99);       // Scan window in ms (must be less than or equal to interval)
+        pBLEScan->setDuplicateFilter(false); // Report all advertisements, even duplicates
         Serial.println("BLE: NimBLE setup completed.");
     } else {
-        Serial.println("BLE: Failed to get BLE Scan object!");
+        Serial.println("BLE: Failed to get NimBLEScan object!");
     }
 }
+
 bool canPetDrink(int petIndex, bool blePart, bool pirPartParam) {
     bool result = false;
     switch (systemMode) {
@@ -358,7 +362,8 @@ bool canPetDrink(int petIndex, bool blePart, bool pirPartParam) {
     }
     return result;
 }
-void setupPIR() { /* ... เหมือนเดิม ... */ 
+
+void setupPIR() {
     Serial.println("PIR: Initializing on pin " + String(PIR_PIN) + "...");
     pinMode(PIR_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(PIR_PIN), pirInterruptHandler, RISING);
@@ -368,13 +373,13 @@ void setupPIR() { /* ... เหมือนเดิม ... */
 
 void setup() {
     Serial.begin(115200);
-    Serial.println("\n---------- Pet Water Tracker (EN OLED) ----------");
+    Serial.println("\n---------- Pet Water Tracker (NimBLE 1.3.8 Logic) ----------");
 
     setupLed();
     setupOled();
 
     if (!SPIFFS.begin(true)) { Serial.println("SPIFFS: Init failed!"); }
-    else { 
+    else {
         Serial.println("SPIFFS: Init success.");
         loadHistoryFromSPIFFS();
         loadSettings();
@@ -388,27 +393,27 @@ void setup() {
     else Serial.println("WiFi: Not connected. NTP skip.");
 
     connectBlynk();
-    setupBLE();
+    setupBLE(); // Initialize BLE
 
     Serial.println("System: Setup completed.");
     Serial.println("System Mode: " + String(systemMode == 0 ? "BLE Only" : (systemMode == 1 ? "PIR Only" : "BLE+PIR")));
 }
 
-void printStatusLine(bool force) { /* ... เหมือนเดิม ... */ 
-    static int lastActiveIndex_print = -99; 
-    static bool lastPirState_print = false; 
+void printStatusLine(bool force) {
+    static int lastActiveIndex_print = -99;
+    static bool lastPirLogicState_print = false; // Use pirTriggered (logic state)
 
     bool shouldPrint = force ||
                        (activePetIndex != lastActiveIndex_print) ||
-                       (pirTriggered != lastPirState_print); 
+                       (pirTriggered != lastPirLogicState_print); // Compare with logic state
 
     if (shouldPrint) {
         String statusLine = "[MODE:" + String(systemMode == 0 ? "BLE" : (systemMode == 1 ? "PIR" : "BLE+PIR"));
-        statusLine += "|PIR:" + String(pirTriggered ? "Y" : "N"); 
+        statusLine += "|PIR:" + String(pirTriggered ? "Y" : "N"); // Use pirTriggered
         statusLine += "|PET:";
 
         if (activePetIndex >= 0) {
-            statusLine += String(pets[activePetIndex].name_en); // ใช้ชื่ออังกฤษใน Log ด้วยถ้าต้องการ
+            statusLine += String(pets[activePetIndex].name_en);
             float elapsed = (millis() - pets[activePetIndex].startTimeMs) / 1000.0f;
             statusLine += " " + String(elapsed, 1) + "s";
         } else {
@@ -418,7 +423,7 @@ void printStatusLine(bool force) { /* ... เหมือนเดิม ... */
 
         for (int i = 0; i < 3; i++) {
             if (pets[i].isNearby || pets[i].presenceConfirmCount > 0 || pets[i].pirDetected) {
-                statusLine += String(pets[i].name_en) + "(" + // ใช้ชื่ออังกฤษใน Log ด้วยถ้าต้องการ
+                statusLine += String(pets[i].name_en) + "(" +
                               "C:" + String(pets[i].presenceConfirmCount) +
                               ",N:" + String(pets[i].isNearby ? "Y" : "N") +
                               ") ";
@@ -426,7 +431,7 @@ void printStatusLine(bool force) { /* ... เหมือนเดิม ... */
         }
         Serial.println(statusLine);
         lastActiveIndex_print = activePetIndex;
-        lastPirState_print = pirTriggered; 
+        lastPirLogicState_print = pirTriggered; // Update with logic state
     }
 }
 
@@ -444,24 +449,31 @@ void loop() {
         settingsChanged = false;
     }
 
-    processPirState();
+    processPirState(); // Process PIR logic
 
     if (pirTriggered || activePetIndex != -1) {
-        scanInterval = 250;
+        scanInterval = 250; // Scan more frequently if PIR is active or pet is drinking
     } else {
-        scanInterval = 1000;
+        scanInterval = 1000; // Default scan interval
     }
 
     if (currentMillis - lastScanTime >= scanInterval) {
         lastScanTime = currentMillis;
-        if ((systemMode == 0 || systemMode == 2) && pBLEScan != nullptr && !pBLEScan->isScanning()) {
-            performBLEScan();
+        if ((systemMode == 0 || systemMode == 2) && pBLEScan != nullptr) { // Check pBLEScan for null
+            if (!pBLEScan->isScanning()) { // Check if not already scanning
+                 performBLEScan();
+            } else {
+                 // Serial.println("BLE: Scan attempt while already scanning in loop. Skipping."); // Optional log
+            }
         }
-        else if (pBLEScan == nullptr) Serial.println("Error: pBLEScan is null! Cannot scan.");
+        else if (pBLEScan == nullptr && (systemMode == 0 || systemMode == 2)) {
+            Serial.println("Error: pBLEScan is null in loop! Cannot scan.");
+        }
     }
     
-    handleLedIndicators();
+    handleLedIndicators(); // Handle LED state
 
+    // OLED Update Logic
     bool oledStateRelevantDataChanged = false;
     if (activePetIndex != previousActivePetIndex_oled) {
         oledStateRelevantDataChanged = true;
@@ -479,13 +491,15 @@ void loop() {
         lastOledUpdateTime = currentMillis;
     }
 
-    printStatusLine(false);
+    printStatusLine(false); // Print status line if changed
 
-    if (currentMillis - lastHeartbeatTime >= 300000) {
+    // Blynk Heartbeat
+    if (currentMillis - lastHeartbeatTime >= 300000) { // 5 minutes
         lastHeartbeatTime = currentMillis;
         if (blynkConnected) Blynk.virtualWrite(VPIN_HEARTBEAT, millis() / 1000);
     }
 
+    // Periodic Debug Print
     if (currentMillis - lastTimeDebugPrint >= timeDebugInterval) {
         lastTimeDebugPrint = currentMillis;
         if (wifiConnected && year() >= 2024) {
@@ -496,7 +510,7 @@ void loop() {
             Serial.println("Active Pet: " + String(activePetIndex >= 0 ? pets[activePetIndex].name_en : "None"));
             for (int i = 0; i < 3; i++) {
                 Serial.printf("Pet%d: %s (%s) [Cnt:%d, Last:%s, R:%.1f, Conf:%d, PIR:%s, nearby:%s]\n",
-                              i+1, pets[i].name, pets[i].name_en, // แสดงทั้งสองชื่อใน log
+                              i+1, pets[i].name, pets[i].name_en,
                               pets[i].drinkingCount,
                               pets[i].lastDrinkTimeStr.c_str(),
                               pets[i].filteredRSSI,
@@ -516,61 +530,72 @@ void loop() {
     }
 }
 
-void processPirState() { /* ... เหมือนเดิม ... */ 
-    if (!pirEnabled || systemMode == 0) { 
-        pirTriggered = false; 
+
+void processPirState() {
+    if (!pirEnabled || systemMode == 0) { // If PIR is disabled or system is BLE-only
+        if (pirTriggered) { // If it was triggered before mode change, reset it
+            // Serial.println("PIR: Disabled or BLE_ONLY mode, resetting pirTriggered flag.");
+            pirTriggered = false;
+        }
         return;
     }
 
     bool currentPirPinState = digitalRead(PIR_PIN) == HIGH;
     unsigned long currentTime = millis();
 
+    // Send PIR hardware status to Blynk if it changed
     if (currentPirPinState != lastPirStateSensor && blynkConnected) {
         Blynk.virtualWrite(VPIN_PIR_STATUS, currentPirPinState ? 1 : 0);
     }
 
-    if (!currentPirPinState && lastPirStateSensor) { 
-        lastPirLowTime = currentTime;
+    if (!currentPirPinState && lastPirStateSensor) { // Falling edge (HIGH to LOW)
+        lastPirLowTime = currentTime; // Record time when PIR pin went LOW
     }
     
+    // Determine logical pirTriggered state
+    // It's triggered if pin is HIGH, OR if pin is LOW but was HIGH recently (within PIR_MAX_GAP_MS)
     if (currentPirPinState || (currentTime - lastPirLowTime < PIR_MAX_GAP_MS && lastPirLowTime != 0) ) {
-        if (!pirTriggered && currentPirPinState) { }
+        if (!pirTriggered && currentPirPinState) { // Just became active logically
+            // Serial.println("PIR: Activity detected (pin HIGH or within gap).");
+        }
         pirTriggered = true; 
-    } else {
-        if (pirTriggered) { 
+    } else { // Pin is LOW and has been LOW for longer than PIR_MAX_GAP_MS
+        if (pirTriggered) { // If it was logically active before
             Serial.println("PIR: Activity stopped (pin LOW beyond gap).");
         }
         pirTriggered = false;
     }
     
-    lastPirStateSensor = currentPirPinState; 
+    lastPirStateSensor = currentPirPinState; // Update last known hardware state
 
-    if (systemMode == 1) { 
-        if (pirTriggered) {
-            if (activePetIndex == -1) { 
+    // Handle PIR-Only Mode (systemMode == 1)
+    if (systemMode == 1) { // PIR Only mode
+        if (pirTriggered) { // If PIR is logically active
+            if (activePetIndex == -1) { // And no pet is currently active
                 if (currentTime - lastSessionEndTime < MIN_SESSION_GAP_MS) {
-                    return; 
+                    return; // Too soon after last session
                 }
+                // Assume pet 0 is drinking (simplification for PIR-only)
                 activePetIndex = 0; 
-                pets[activePetIndex].isNearby = true;
+                pets[activePetIndex].isNearby = true; // Mark as nearby (logically)
                 pets[activePetIndex].startTimeMs = currentTime;
                 pets[activePetIndex].dataSent = false;
-                pets[activePetIndex].pirDetected = true; 
+                pets[activePetIndex].pirDetected = true; // Mark PIR detection for this pet
                 pets[activePetIndex].lastPirDetectionTime = currentTime;
-                Serial.println("PIR-ONLY MODE: " + String(pets[activePetIndex].name_en) + " assumed drinking. Timer ON."); // ใช้ชื่อ EN
+                Serial.println("PIR-ONLY MODE: " + String(pets[activePetIndex].name_en) + " assumed drinking. Timer ON.");
                 if (blynkConnected) Blynk.logEvent(pets[activePetIndex].blynkEventName, String(pets[activePetIndex].name_en) + " drinking (PIR)!");
-            } else { 
-                 pets[activePetIndex].lastPirDetectionTime = currentTime;
+            } else { // A pet is already active (must be pet 0 in this mode)
+                 pets[activePetIndex].lastPirDetectionTime = currentTime; // Keep updating PIR detection time
             }
-        } else { 
-            if (activePetIndex != -1) { 
+        } else { // PIR is not logically active
+            if (activePetIndex != -1) { // If a pet (pet 0) was active
                 unsigned long durationMillis = currentTime - pets[activePetIndex].startTimeMs;
                 float durationInSeconds = durationMillis / 1000.0f;
 
                 if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
                     pets[activePetIndex].drinkingCount++;
                     sendToBlynkPetData(activePetIndex, durationInSeconds);
-                    saveHistoryData(pets[activePetIndex].name, durationInSeconds); // เก็บชื่อไทยใน history
+                    saveHistoryData(pets[activePetIndex].name, durationInSeconds);
                     Serial.println("PIR-ONLY MODE: " + String(pets[activePetIndex].name_en) + " session ENDED. Duration: " + String(durationInSeconds, 1) + "s");
                 } else {
                     Serial.println("PIR-ONLY MODE: " + String(pets[activePetIndex].name_en) + " session too short (" + String(durationInSeconds, 1) + "s). Ignored.");
@@ -585,7 +610,7 @@ void processPirState() { /* ... เหมือนเดิม ... */
     }
 }
 
-
+// ** ปรับแก้ performBLEScan ให้สอดคล้องกับ NimBLE 1.3.8 (blocking scan) **
 void performBLEScan() {
     if (!wifiConnected || pBLEScan == nullptr) {
         generalRecentBleActivity = false;
@@ -594,10 +619,29 @@ void performBLEScan() {
     }
 
     NimBLEScanResults foundDevices;
+
     if (!pBLEScan->isScanning()) {
-        foundDevices = pBLEScan->start(BLE_SCAN_DURATION_SEC, false);
+        // Serial.println("BLE_MAIN: Starting blocking scan..."); // เปิดถ้าต้องการดู Log นี้
+        foundDevices = pBLEScan->start(BLE_SCAN_DURATION_SEC, false); // Blocking call
+        // Serial.printf("BLE_MAIN: Blocking scan finished. Found %d unique devices in results.\n", foundDevices.getCount()); // เปิดถ้าต้องการดู Log นี้
+
+        // --- Optional Debug: Print all devices found by this blocking scan ---
+        // if (showDetailedBLEScan) { // หรือเงื่อนไขอื่นที่คุณต้องการ
+        //     Serial.printf("BLE_MAIN_DETAIL: Devices actually found: %d\n", foundDevices.getCount());
+        //     for (int scan_idx = 0; scan_idx < foundDevices.getCount(); scan_idx++) {
+        //         NimBLEAdvertisedDevice advDev = foundDevices.getDevice(scan_idx); // NimBLE 1.3.8 returns object
+        //         Serial.print("  Dev ["); Serial.print(scan_idx); Serial.print("]: ");
+        //         Serial.print(advDev.getAddress().toString().c_str());
+        //         if (advDev.haveName()) {
+        //             Serial.print(", Name: '"); Serial.print(advDev.getName().c_str()); Serial.print("'");
+        //         }
+        //         Serial.print(", RSSI: "); Serial.println(advDev.getRSSI());
+        //     }
+        // }
+        // --- End Optional Debug ---
+
     } else {
-        return; 
+        return;
     }
 
     PetScanData petScanResults[3];
@@ -605,13 +649,14 @@ void performBLEScan() {
         petScanResults[i].petIndex = i;
         petScanResults[i].foundThisScan = false;
         petScanResults[i].avgRSSI = -100;
-        petScanResults[i].isMoving = true; 
+        petScanResults[i].isMoving = true; // Default to moving
     }
     int currentScanStrongestPetIdx = -1;
     float currentScanStrongestSignal = -200.0f;
 
     for (int i = 0; i < foundDevices.getCount(); i++) {
-        NimBLEAdvertisedDevice advDev = foundDevices.getDevice(i);
+        NimBLEAdvertisedDevice advDev = foundDevices.getDevice(i); // NimBLE 1.3.8 returns object
+
         String devName = advDev.haveName() ? advDev.getName().c_str() : "";
         String devMAC = advDev.getAddress().toString().c_str(); devMAC.toUpperCase();
         int rssi = advDev.getRSSI();
@@ -619,13 +664,31 @@ void performBLEScan() {
         for (int pIdx = 0; pIdx < 3; ++pIdx) {
             String targetMACStr = String(pets[pIdx].targetMAC); targetMACStr.toUpperCase();
             if ((devName.length() > 0 && devName == pets[pIdx].targetName) || devMAC == targetMACStr) {
+                // if (showDetailedBLEScan) { // ย้าย Log ไปแสดงละเอียดใน BLE_DETAIL ทีหลัง
+                //     Serial.printf("BLE_MAIN: Matched Pet! Scanned Name: '%s', Scanned MAC: %s with target %s (MAC: %s), RSSI: %d\n",
+                //                   devName.c_str(), devMAC.c_str(), pets[pIdx].name_en, targetMACStr.c_str(), rssi);
+                // }
                 updateRSSIBufferAndFilter(pIdx, rssi);
                 petScanResults[pIdx].foundThisScan = true;
                 petScanResults[pIdx].avgRSSI = pets[pIdx].filteredRSSI;
-                petScanResults[pIdx].isMoving = calculateMovement(pets[pIdx].rssiBuffer); // <--- ตรวจสอบ return type
+                petScanResults[pIdx].isMoving = calculateMovement(pets[pIdx].rssiBuffer);
+
+                // --- DEBUG: แสดงผลลัพธ์ isMoving ของสัตว์เลี้ยงที่ต้องการทดสอบ ---
+                // แก้ไข pIdx == X ให้ตรงกับ index ของสัตว์เลี้ยงที่ต้องการ debug (0, 1, หรือ 2)
+                if (pIdx == 1 && showDetailedBLEScan) { // สมมติ "ลัคกี้" คือ pets[1]
+                    Serial.printf("DEBUG_MOVEMENT: Pet %s (idx %d) isMoving: %s, RSSI_raw: %d, RSSI_filt: %.1f, Buffer: [%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
+                                  pets[pIdx].name_en, pIdx,
+                                  petScanResults[pIdx].isMoving ? "TRUE" : "FALSE",
+                                  rssi,
+                                  pets[pIdx].filteredRSSI,
+                                  pets[pIdx].rssiBuffer[0], pets[pIdx].rssiBuffer[1], pets[pIdx].rssiBuffer[2], pets[pIdx].rssiBuffer[3], pets[pIdx].rssiBuffer[4],
+                                  pets[pIdx].rssiBuffer[5], pets[pIdx].rssiBuffer[6], pets[pIdx].rssiBuffer[7], pets[pIdx].rssiBuffer[8], pets[pIdx].rssiBuffer[9]
+                                  );
+                }
+                // --- END DEBUG ---
 
                 bool blePart = (petScanResults[pIdx].avgRSSI > RSSI_ENTER_THRESHOLD && !petScanResults[pIdx].isMoving);
-                if (!pets[pIdx].isNearby && canPetDrink(pIdx, blePart, pirTriggered)) { 
+                if (!pets[pIdx].isNearby && canPetDrink(pIdx, blePart, pirTriggered)) {
                     if (petScanResults[pIdx].avgRSSI > currentScanStrongestSignal) {
                         currentScanStrongestSignal = petScanResults[pIdx].avgRSSI;
                         currentScanStrongestPetIdx = pIdx;
@@ -635,7 +698,10 @@ void performBLEScan() {
             }
         }
     }
-    if (pBLEScan != nullptr) pBLEScan->clearResults(); // Check pBLEScan not null before calling
+
+    if (pBLEScan != nullptr) {
+        pBLEScan->clearResults();
+    }
 
     bool localAnyTargetBleFound = false;
     for (int i = 0; i < 3; ++i) {
@@ -648,191 +714,233 @@ void performBLEScan() {
 
     strongBleSignalDetected = false;
     for (int i = 0; i < 3; ++i) {
-        if (pets[i].filteredRSSI >= RSSI_STRONG_SIGNAL_THRESHOLD && pets[i].filteredRSSI < 0) {
+        if (pets[i].filteredRSSI >= RSSI_STRONG_SIGNAL_THRESHOLD && pets[i].filteredRSSI < 0 && petScanResults[i].foundThisScan) {
             strongBleSignalDetected = true;
             break;
         }
     }
     
-    // ... (lastScanHadActivity logic and print) ...
-    bool currentScanHasAnyActivity = false;
+    bool currentScanHasAnyActivity = false; // ประกาศนอก if
     for(int i=0; i<3; ++i) {
         if(petScanResults[i].foundThisScan || pets[i].isNearby || pets[i].presenceConfirmCount > 0 || activePetIndex != -1) {
             currentScanHasAnyActivity = true;
             break;
         }
     }
-    if (showDetailedBLEScan && (currentScanHasAnyActivity || lastScanHadActivity) ) { 
+
+    if (showDetailedBLEScan && (currentScanHasAnyActivity || lastScanHadActivity || generalRecentBleActivity) ) {
         Serial.print("BLE_DETAIL: ");
         for(int i=0; i<3; ++i) {
             Serial.printf("P%d(F:%d,R:%.0f,M:%d,C:%d,N:%d) ",
-                            i+1,
-                            petScanResults[i].foundThisScan,
-                            petScanResults[i].avgRSSI,
-                            petScanResults[i].isMoving ? 1 : 0,
-                            pets[i].presenceConfirmCount,
-                            pets[i].isNearby ? 1:0);
+                          i+1,
+                          petScanResults[i].foundThisScan,
+                          pets[i].filteredRSSI,
+                          petScanResults[i].isMoving ? 1 : 0, // แสดงผล isMoving จาก petScanResults
+                          pets[i].presenceConfirmCount,
+                          pets[i].isNearby ? 1:0);
         }
         if(currentScanStrongestPetIdx != -1 && activePetIndex == -1)
-            Serial.printf("-> Cand: %s", pets[currentScanStrongestPetIdx].name_en); // ใช้ชื่อ EN
+            Serial.printf("-> Cand: %s (RSSI: %.0f)", pets[currentScanStrongestPetIdx].name_en, currentScanStrongestSignal);
         else if (activePetIndex != -1)
-            Serial.printf("-> Active: %s", pets[activePetIndex].name_en); // ใช้ชื่อ EN
+            Serial.printf("-> Active: %s", pets[activePetIndex].name_en);
         Serial.println();
     }
-    lastScanHadActivity = currentScanHasAnyActivity;
+    lastScanHadActivity = currentScanHasAnyActivity || generalRecentBleActivity;
 
-    // ... (processScannedPet logic) ...
+
     if (activePetIndex != -1) {
         processScannedPet(activePetIndex,
-                          true, 
+                          true,
                           petScanResults[activePetIndex].foundThisScan,
-                          petScanResults[activePetIndex].avgRSSI,
+                          pets[activePetIndex].filteredRSSI, // ใช้ filteredRSSI ที่อัปเดตแล้ว
                           petScanResults[activePetIndex].isMoving);
         for (int i = 0; i < 3; ++i) {
-            if (i != activePetIndex && pets[i].isNearby) { 
+            if (i != activePetIndex && pets[i].isNearby) {
                 Serial.println("NOTICE: " + String(pets[i].name_en) + " flags reset because " + String(pets[activePetIndex].name_en) + " is active.");
                 pets[i].isNearby = false; pets[i].presenceConfirmCount = 0; pets[i].dataSent = true;
                 pets[i].consecutiveMissCount = 0; pets[i].pirDetected = false;
             }
         }
-    } else { 
+    } else {
         if (currentScanStrongestPetIdx != -1) {
             if (millis() - lastSessionEndTime < MIN_SESSION_GAP_MS) {
-                 return;
+                return;
             }
             processScannedPet(currentScanStrongestPetIdx,
                               true,
                               petScanResults[currentScanStrongestPetIdx].foundThisScan,
-                              petScanResults[currentScanStrongestPetIdx].avgRSSI,
+                              pets[currentScanStrongestPetIdx].filteredRSSI, // ใช้ filteredRSSI
                               petScanResults[currentScanStrongestPetIdx].isMoving);
             for (int i = 0; i < 3; ++i) {
                 if (i != currentScanStrongestPetIdx) {
                     pets[i].presenceConfirmCount = 0;
                 }
             }
-        } else { 
+        } else {
             for (int i = 0; i < 3; ++i) {
-                bool blePart = (petScanResults[i].avgRSSI > RSSI_ENTER_THRESHOLD && !petScanResults[i].isMoving);
-                if (petScanResults[i].foundThisScan && !canPetDrink(i, blePart, pirTriggered)) { 
-                    if(pets[i].presenceConfirmCount > 0) pets[i].presenceConfirmCount--;
-                } else if (!petScanResults[i].foundThisScan && pets[i].presenceConfirmCount > 0) { 
-                     pets[i].presenceConfirmCount = 0; 
+                // ใช้ pets[i].filteredRSSI ที่อาจจะถูกอัปเดตจาก scan ก่อนหน้าถ้า beacon ไม่ได้ advertise ทุกรอบ
+                bool blePart = (pets[i].filteredRSSI > RSSI_ENTER_THRESHOLD && !petScanResults[i].isMoving);
+                if (petScanResults[i].foundThisScan && !canPetDrink(i, blePart, pirTriggered)) {
+                    if(pets[i].presenceConfirmCount > 0) {
+                        pets[i].presenceConfirmCount--;
+                    }
+                } else if (!petScanResults[i].foundThisScan && pets[i].presenceConfirmCount > 0) {
+                    pets[i].presenceConfirmCount = 0;
                 }
             }
         }
     }
 }
 
+// ฟังก์ชัน processScannedPet() ฉบับเต็มพร้อม Debug เพิ่มเติม
+
+
 void processScannedPet(int petIndex, bool isPrimaryCandidate, bool wasPetFoundInScan, int scannedAvgRSSI, bool scannedIsMoving) {
-    // ... (เหมือนเดิม, แต่ถ้ามี Serial.print ชื่อสัตว์เลี้ยง อาจจะอยากใช้ name_en) ...
-    // ตัวอย่างการแก้ไขชื่อใน Log (ถ้าต้องการ)
-    // Serial.println("PROCESS: " + String(pets[petIndex].name_en) + " ...");
     PetState &pet = pets[petIndex];
     unsigned long currentTime = millis();
-    bool effectivePirState = (systemMode == 0) ? true : pirTriggered; 
+    // Effective PIR state depends on system mode. In BLE_ONLY mode, PIR is effectively always "true" for canPetDrink logic.
+    // However, for pirDetected flag within pet state, it should reflect actual PIR if systemMode is not BLE_ONLY.
+    // bool effectivePirStateForCanDrink = (systemMode == 0) ? true : pirTriggered; (This is handled in canPetDrink)
 
-    if (pirTriggered) { 
+    if (systemMode != 0 && pirTriggered) { // Update pet's PIR detection if PIR is part of the system mode
         pet.pirDetected = true;
         pet.lastPirDetectionTime = currentTime;
-    } else if (currentTime - pet.lastPirDetectionTime > PIR_MAX_GAP_MS) {
+    } else if (systemMode != 0 && !pirTriggered && (currentTime - pet.lastPirDetectionTime > PIR_MAX_GAP_MS) && pet.lastPirDetectionTime > 0) {
+        // If PIR was active for this pet, but now global pirTriggered is false for too long
         pet.pirDetected = false;
     }
 
-    if (pet.isNearby) { 
-        if (systemMode == 2 && !pet.pirDetected && (currentTime - pet.lastPirDetectionTime > PIR_MAX_GAP_MS && pet.lastPirDetectionTime > 0) ) {
-            Serial.println("PROCESS: " + String(pet.name_en) + " PIR inactive. Ending.");
+
+    if (pet.isNearby) { // If pet is currently considered drinking/nearby
+        // Condition to stop: PIR becomes inactive (only if mode requires PIR)
+        if (systemMode == 2 && !pet.pirDetected) { // Check pet's specific pirDetected flag
+             // Add a grace period for PIR to become active again if BLE is still strong.
+             // If lastPirDetectionTime is old, then end session.
+            if (currentTime - pet.lastPirDetectionTime > (PIR_MAX_GAP_MS +2000 ) && pet.lastPirDetectionTime > 0) { // Add small buffer
+                Serial.println("PROCESS: " + String(pet.name_en) + " session ENDED (PIR inactive too long).");
+                unsigned long durationMillis = currentTime - pet.startTimeMs;
+                float durationInSeconds = durationMillis / 1000.0f;
+                if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
+                    pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
+                } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (PIR timeout). Ignored.");
+                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; pet.pirDetected = false;
+                if (activePetIndex == petIndex) { activePetIndex = -1; lastSessionEndTime = currentTime; }
+                return;
+            }
+        }
+
+        // Condition to stop: BLE signal lost (only if mode requires BLE)
+        if (systemMode != 1 && !wasPetFoundInScan) { // If not PIR_ONLY mode and BLE not found
+            pet.consecutiveMissCount++;
+            Serial.println("PROCESS: " + String(pet.name_en) + " BLE signal lost. Miss count: " + String(pet.consecutiveMissCount));
+            if (pet.consecutiveMissCount >= MAX_CONSECUTIVE_MISSES) {
+                Serial.println("PROCESS: " + String(pet.name_en) + " session ENDED (BLE lost too many times).");
+                // ... (end session logic, same as above)
+                unsigned long durationMillis = currentTime - pet.startTimeMs;
+                float durationInSeconds = durationMillis / 1000.0f;
+                if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
+                    pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
+                } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (BLE loss). Ignored.");
+                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; pet.pirDetected = false;
+                if (activePetIndex == petIndex) { activePetIndex = -1; lastSessionEndTime = currentTime; }
+                return;
+            }
+        } else { // BLE signal found (or PIR_ONLY mode)
+            pet.consecutiveMissCount = 0; // Reset miss count
+        }
+
+        // Condition to stop: Max drinking time exceeded
+        if (currentTime - pet.startTimeMs > MAX_STATIONARY_DURATION_MS) {
+            Serial.println("PROCESS: " + String(pet.name_en) + " session ENDED (Max stationary time exceeded).");
+            // ... (end session logic) ...
             unsigned long durationMillis = currentTime - pet.startTimeMs;
             float durationInSeconds = durationMillis / 1000.0f;
             if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
                 pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
-            } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (PIR timeout).");
+            } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (Max time). Ignored.");
             pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; pet.pirDetected = false;
             if (activePetIndex == petIndex) { activePetIndex = -1; lastSessionEndTime = currentTime; }
             return;
         }
 
-        if (!wasPetFoundInScan && systemMode != 1) {
-            pet.consecutiveMissCount++;
-            Serial.println("PROCESS: " + String(pet.name_en) + " BLE lost. Miss: " + String(pet.consecutiveMissCount));
-            if (pet.consecutiveMissCount >= MAX_CONSECUTIVE_MISSES) {
-                Serial.println("PROCESS: " + String(pet.name_en) + " BLE lost too many. Ending.");
-                unsigned long durationMillis = currentTime - pet.startTimeMs;
-                float durationInSeconds = durationMillis / 1000.0f;
-                if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
-                    pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
-                } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (BLE loss).");
-                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; pet.pirDetected = false;
-                if (activePetIndex == petIndex) { activePetIndex = -1; lastSessionEndTime = currentTime; }
-            }
-        } else { 
-            pet.consecutiveMissCount = 0;
-            if (currentTime - pet.startTimeMs > MAX_STATIONARY_DURATION_MS) {
-                Serial.println("PROCESS: " + String(pet.name_en) + " MAX time. Ending.");
-                unsigned long durationMillis = currentTime - pet.startTimeMs; 
-                float durationInSeconds = durationMillis / 1000.0f;
-                 if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
-                    pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
-                } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (MAX time).");
-                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; pet.pirDetected = false;
-                if (activePetIndex == petIndex) { activePetIndex = -1; lastSessionEndTime = currentTime; }
-            }
-            else if (systemMode != 1 && ((scannedAvgRSSI <= RSSI_EXIT_THRESHOLD -5 ) || (scannedIsMoving && scannedAvgRSSI <= RSSI_EXIT_THRESHOLD))) {
-                Serial.println("PROCESS: " + String(pet.name_en) + " Left/Moved. Ending.");
-                unsigned long durationMillis = currentTime - pet.startTimeMs;
-                float durationInSeconds = durationMillis / 1000.0f;
-                if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
-                    pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
-                } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (Left/Moved).");
-                pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; pet.pirDetected = false;
-                if (activePetIndex == petIndex) { activePetIndex = -1; lastSessionEndTime = currentTime; }
-            }
+        // Condition to stop: Pet moved away or RSSI too weak (only if mode requires BLE)
+        if (systemMode != 1 && wasPetFoundInScan && ((scannedAvgRSSI <= RSSI_EXIT_THRESHOLD -5 ) || (scannedIsMoving && scannedAvgRSSI <= RSSI_EXIT_THRESHOLD))) {
+             Serial.println("PROCESS: " + String(pet.name_en) + " session ENDED (Left or Moved significantly). RSSI: " + String(scannedAvgRSSI) + " Moving: " + String(scannedIsMoving));
+            // ... (end session logic) ...
+            unsigned long durationMillis = currentTime - pet.startTimeMs;
+            float durationInSeconds = durationMillis / 1000.0f;
+            if (durationInSeconds >= MIN_DRINKING_TIME_SEC) {
+                pet.drinkingCount++; sendToBlynkPetData(petIndex, durationInSeconds); saveHistoryData(pet.name, durationInSeconds);
+            } else Serial.println("PROCESS: " + String(pet.name_en) + " session short (Left/Moved). Ignored.");
+            pet.isNearby = false; pet.dataSent = true; pet.presenceConfirmCount = 0; pet.consecutiveMissCount = 0; pet.pirDetected = false;
+            if (activePetIndex == petIndex) { activePetIndex = -1; lastSessionEndTime = currentTime; }
+            return;
         }
-    } else { 
+
+    } else { // Pet is not currently considered nearby/drinking - try to start session
         bool bleEntryCondition = isPrimaryCandidate && wasPetFoundInScan && scannedAvgRSSI > RSSI_ENTER_THRESHOLD && !scannedIsMoving;
-        
-        if (canPetDrink(petIndex, bleEntryCondition, effectivePirState)) {
-            if (activePetIndex == -1) { 
+        // For canPetDrink, pirTriggered is the global PIR state.
+        // pet.pirDetected is updated if pirTriggered is true and mode requires PIR.
+        bool actualPirNeededAndActive = (systemMode == 0) ? true : ( (systemMode == 1 || systemMode == 2) && pirTriggered );
+
+
+        if (canPetDrink(petIndex, bleEntryCondition, actualPirNeededAndActive)) {
+            if (activePetIndex == -1) { // No other pet is active
                 if (currentTime - lastSessionEndTime < MIN_SESSION_GAP_MS) {
-                    return; 
+                    return; // Too soon
                 }
-                bool fastDetection = pirTriggered && wasPetFoundInScan && scannedAvgRSSI > (RSSI_ENTER_THRESHOLD + 10); 
-                int requiredConfirmations = pirTriggered ? PRESENCE_CONFIRMATION_SCANS_PIR : PRESENCE_CONFIRMATION_SCANS;
+
+                // If mode uses PIR, pet.pirDetected should be true now from the block at the start of this function.
+                // If mode is BLE_ONLY, pet.pirDetected doesn't matter for starting session.
+                // If mode is PIR_ONLY, bleEntryCondition doesn't matter.
+
+                int requiredConfirmations = PRESENCE_CONFIRMATION_SCANS;
+                if (systemMode == 2 && pirTriggered) requiredConfirmations = PRESENCE_CONFIRMATION_SCANS_PIR;
+                else if (systemMode == 1) requiredConfirmations = 1; // PIR only, one trigger is enough with debounce
+
+
+                bool fastDetection = (systemMode == 2 && pirTriggered && wasPetFoundInScan && scannedAvgRSSI > (RSSI_ENTER_THRESHOLD + 10) && !scannedIsMoving);
                 
                 if (fastDetection) {
-                    pet.presenceConfirmCount = requiredConfirmations; 
-                     Serial.println("PROCESS: " + String(pet.name_en) + " FAST DETECT!");
+                    pet.presenceConfirmCount = requiredConfirmations;
+                     Serial.println("PROCESS: " + String(pet.name_en) + " FAST DETECT! Conditions met.");
                 } else {
                     pet.presenceConfirmCount++;
                 }
-                
-                if(pirTriggered) { pet.pirDetected = true; pet.lastPirDetectionTime = currentTime; }
+                 if (systemMode != 0 && pirTriggered) { // If PIR is involved and active, mark it for the pet
+                    pet.pirDetected = true;
+                    pet.lastPirDetectionTime = currentTime;
+                }
+
 
                 Serial.println("PROCESS: " + String(pet.name_en) + " Confirming: " +
                                String(pet.presenceConfirmCount) + "/" + String(requiredConfirmations) +
-                               (pirTriggered ? " (PIR)" : "") + " RSSI:" + String(scannedAvgRSSI) + " Mov:" + String(scannedIsMoving));
+                               (pirTriggered && systemMode !=0 ? " (PIR Active)" : "") + " RSSI:" + String(scannedAvgRSSI) + " Mov:" + String(scannedIsMoving));
 
                 if (pet.presenceConfirmCount >= requiredConfirmations) {
                     activePetIndex = petIndex;
                     pet.isNearby = true;
-                    pet.startTimeMs = currentTime; 
+                    pet.startTimeMs = currentTime;
                     pet.dataSent = false;
-                    pet.consecutiveMissCount = 0;
+                    pet.consecutiveMissCount = 0; // Reset miss count on new session
+                    // pet.pirDetected is already set if applicable
                     Serial.println("PROCESS: " + String(pet.name_en) + " CONFIRMED! Timer started.");
-                    if (blynkConnected) Blynk.logEvent(pet.blynkEventName, String(pets[petIndex].name_en) + " is drinking!"); // ใช้ชื่อ EN
-                    pet.presenceConfirmCount = 0; 
+                    if (blynkConnected) Blynk.logEvent(pet.blynkEventName, String(pets[petIndex].name_en) + " is drinking!");
+                    pet.presenceConfirmCount = 0; // Reset for next time
                 }
-            } else { 
-                pet.presenceConfirmCount = 0; 
+            } else { // Another pet is already active
+                pet.presenceConfirmCount = 0; // Don't increment if another pet is active
             }
-        } else { 
-            if (pet.presenceConfirmCount > 0) { 
-                pet.presenceConfirmCount--;
+        } else { // Conditions not met for starting a session
+            if (pet.presenceConfirmCount > 0) {
+                pet.presenceConfirmCount--; // Decrement if conditions were previously met but not now
             }
         }
     }
 }
 
-bool calculateMovement(int* rssiBuffer) { // แก้ไขให้ return bool
+
+bool calculateMovement(int* rssiBuffer) {
     float variation = 0; int validReadings = 0;
     for (int i = 1; i < 10; i++) {
         if (rssiBuffer[i-1] > -100 && rssiBuffer[i-1] < 0 && rssiBuffer[i] > -100 && rssiBuffer[i] < 0) {
@@ -840,14 +948,17 @@ bool calculateMovement(int* rssiBuffer) { // แก้ไขให้ return boo
             validReadings++;
         }
     }
-    if (validReadings < 2) return false; 
+    if (validReadings < 2) return false; // Need at least 2 good readings to compare
     return (variation / (float)validReadings) > MOVEMENT_THRESHOLD;
 }
 
-void updateRSSIBufferAndFilter(int petIndex, int newRSSI) { /* ... เหมือนเดิม ... */ 
+void updateRSSIBufferAndFilter(int petIndex, int newRSSI) {
     PetState &pet = pets[petIndex];
+    // Shift buffer
     for (int i = 9; i > 0; i--) pet.rssiBuffer[i] = pet.rssiBuffer[i - 1];
-    pet.rssiBuffer[0] = (newRSSI < 0 && newRSSI >= -100) ? newRSSI : -100;
+    // Add new reading
+    pet.rssiBuffer[0] = (newRSSI < 0 && newRSSI >= -100) ? newRSSI : -100; // Ensure valid RSSI range
+    // Calculate filtered RSSI (simple moving average)
     long sum = 0; int count = 0;
     for (int i = 0; i < 10; i++) {
         if (pet.rssiBuffer[i] > -100 && pet.rssiBuffer[i] < 0) { sum += pet.rssiBuffer[i]; count++; }
@@ -856,14 +967,14 @@ void updateRSSIBufferAndFilter(int petIndex, int newRSSI) { /* ... เหมื�
 }
 
 
-void sendToBlynkPetData(int petIndex, float duration) { // ปรับปรุงสำหรับ Blue LED
+void sendToBlynkPetData(int petIndex, float duration) {
     PetState &pet = pets[petIndex];
     if (blynkConnected) {
-        Serial.println("BLYNK_SEND: " + String(pet.name_en) + " duration=" + String(duration, 2) + "s");
+        Serial.println("BLYNK_SEND: " + String(pet.name_en) + " duration=" + String(duration, 2) + "s, Count=" + String(pet.drinkingCount));
         Blynk.virtualWrite(pet.pinDuration, duration);
         Blynk.virtualWrite(pet.pinCountDisplay, pet.drinkingCount);
         time_t t_utc = now(), t_local = t_utc + gmtOffset_sec;
-        if (year(t_local) < 2024) {
+        if (year(t_local) < 2024) { // Check if time is valid
             pet.lastDrinkTimeStr = "--:--"; pet.lastDrinkDateStr = "--/--/----";
         } else {
             char tb[9]; sprintf(tb, "%02d:%02d", hour(t_local), minute(t_local)); pet.lastDrinkTimeStr = String(tb);
@@ -876,17 +987,17 @@ void sendToBlynkPetData(int petIndex, float duration) { // ปรับปรุ
         blueLedActive = true;
         Serial.println("LED: Blue light triggered by Blynk send for " + String(pet.name_en));
 
-        Blynk.syncVirtual(pet.pinDuration, pet.pinCountDisplay, pet.pinLastTimeDisplay, pet.pinLastDateDisplay);
+        // Blynk.syncVirtual(pet.pinDuration, pet.pinCountDisplay, pet.pinLastTimeDisplay, pet.pinLastDateDisplay); // Not always needed
         Serial.println("RECORD: " + String(pet.name_en) + " drink " + String(duration,1) + "s (total " + String(pet.drinkingCount) + " times)");
-        settingsChanged = true;
+        settingsChanged = true; // Mark settings as changed to trigger save
     } else {
         Serial.println("Blynk N/C. Data for " + String(pet.name_en) + " not sent.");
     }
 }
 
 // --- ส่วนที่เหลือของฟังก์ชัน (syncAllDataToBlynk, resetDailyCounters, SPIFFS, WiFi/Blynk connect, BLYNK_WRITE handlers) ---
-// --- ควรจะเหมือนเดิมกับเวอร์ชันล่าสุดที่คุณมี ---
-void syncAllDataToBlynk() { 
+// --- ควรจะเหมือนเดิมกับเวอร์ชันที่คุณมี และทำงานได้ดีอยู่แล้ว ---
+void syncAllDataToBlynk() {
     if (blynkConnected) {
         Serial.println("Blynk: Syncing all data...");
         for (int i=0; i<3; ++i) {
@@ -896,20 +1007,21 @@ void syncAllDataToBlynk() {
             Blynk.virtualWrite(pets[i].pinLastDateDisplay, pets[i].lastDrinkDateStr);
         }
         Blynk.virtualWrite(VPIN_RSSI_THRESHOLD_SLIDER, RSSI_ENTER_THRESHOLD);
-        Blynk.virtualWrite(VPIN_PIR_STATUS, digitalRead(PIR_PIN)); 
+        Blynk.virtualWrite(VPIN_PIR_STATUS, digitalRead(PIR_PIN)); // Send current hardware pin state
         Blynk.virtualWrite(VPIN_PIR_SENSITIVITY, pirSensitivity);
         Blynk.virtualWrite(VPIN_SYSTEM_MODE, systemMode);
         Serial.println("Blynk: Sync complete.");
     }
 }
 
-void resetDailyCounters() { /* ... เหมือนเดิม ... */ 
+void resetDailyCounters() {
     time_t t_utc = now();
+    // Fallback to millis based reset if NTP time is not set
     if (timeStatus() == timeNotSet || year(t_utc + gmtOffset_sec) < 2024) {
         unsigned long cM = millis();
-        if (lastResetTimeMillis == 0) lastResetTimeMillis = cM;
-        if (cM - lastResetTimeMillis >= 86400000UL) { 
-            Serial.println("SYS: Daily Reset (millis)...");
+        if (lastResetTimeMillis == 0) lastResetTimeMillis = cM; // Initialize on first run
+        if (cM - lastResetTimeMillis >= 86400000UL) { // 24 hours in millis
+            Serial.println("SYS: Daily Reset (millis based)...");
             for(int i=0; i<3; ++i) { pets[i].drinkingCount=0; pets[i].lastDrinkTimeStr="--:--"; pets[i].lastDrinkDateStr="--/--/----"; }
             lastResetTimeMillis = cM;
             if (blynkConnected) syncAllDataToBlynk();
@@ -917,11 +1029,14 @@ void resetDailyCounters() { /* ... เหมือนเดิม ... */
         }
         return;
     }
+
+    // NTP time is set, use date based reset
     static int lastResetDay = 0;
     time_t t_loc = t_utc + gmtOffset_sec;
-    if (lastResetDay == 0) lastResetDay = day(t_loc);
+    if (lastResetDay == 0) lastResetDay = day(t_loc); // Initialize on first run with valid time
+
     if (day(t_loc) != lastResetDay) {
-        Serial.println("SYS: Daily Reset (date)...");
+        Serial.println("SYS: Daily Reset (date based)...");
         for(int i=0; i<3; ++i) { pets[i].drinkingCount=0; pets[i].lastDrinkTimeStr="--:--"; pets[i].lastDrinkDateStr="--/--/----"; }
         lastResetDay = day(t_loc);
         if (blynkConnected) syncAllDataToBlynk();
@@ -929,138 +1044,213 @@ void resetDailyCounters() { /* ... เหมือนเดิม ... */
     }
 }
 
-void saveHistoryData(const char* petName, float duration) { /* ... เหมือนเดิม, petName จะเป็นภาษาไทย ... */ 
+void saveHistoryData(const char* petName, float duration) {
     time_t t_utc = now();
     if (year(t_utc + gmtOffset_sec) < 2024) { Serial.println("SPIFFS: Local time invalid, history not saved."); return; }
-    drinkingHistory[historyIndex].petName = String(petName);
+    drinkingHistory[historyIndex].petName = String(petName); // Use Thai name for history
     drinkingHistory[historyIndex].duration = duration;
-    drinkingHistory[historyIndex].timestamp = t_utc;
+    drinkingHistory[historyIndex].timestamp = t_utc; // Store UTC timestamp
     historyIndex = (historyIndex + 1) % MAX_HISTORY_RECORDS;
     static int recSinceLastSave = 0; recSinceLastSave++;
-    if (recSinceLastSave >= 5) { saveHistoryToSPIFFS(); recSinceLastSave = 0; }
+    if (recSinceLastSave >= 5) { // Save to SPIFFS every 5 records
+        saveHistoryToSPIFFS();
+        recSinceLastSave = 0;
+    }
 }
 
-void saveHistoryToSPIFFS() { /* ... เหมือนเดิม ... */ 
-    DynamicJsonDocument doc(16384); JsonArray array = doc.to<JsonArray>(); int validRecs = 0;
-    for(int i=0; i<MAX_HISTORY_RECORDS; ++i) if(drinkingHistory[i].timestamp > 0 && year(drinkingHistory[i].timestamp + gmtOffset_sec) > 2023) validRecs++;
-    if (validRecs == 0) { if (SPIFFS.exists("/history.json")) SPIFFS.remove("/history.json"); return; }
-    int currWIdx = historyIndex; bool isFull = (validRecs == MAX_HISTORY_RECORDS);
-    for (int i = 0; i < validRecs; i++) {
-        int rIdx = isFull ? (currWIdx + i) % MAX_HISTORY_RECORDS : i;
-        if (drinkingHistory[rIdx].timestamp > 0 && year(drinkingHistory[rIdx].timestamp + gmtOffset_sec) > 2023) {
-            JsonObject obj = array.createNestedObject();
-            obj["petName"] = drinkingHistory[rIdx].petName; obj["duration"] = drinkingHistory[rIdx].duration; obj["timestamp"] = drinkingHistory[rIdx].timestamp;
+void saveHistoryToSPIFFS() {
+    DynamicJsonDocument doc(16384); // Adjust size if needed based on MAX_HISTORY_RECORDS
+    JsonArray array = doc.to<JsonArray>();
+    int validRecs = 0;
+    for(int i=0; i<MAX_HISTORY_RECORDS; ++i) {
+        if(drinkingHistory[i].timestamp > 0 && year(drinkingHistory[i].timestamp + gmtOffset_sec) > 2023) {
+            validRecs++;
         }
     }
-    if (array.size() == 0) { if (SPIFFS.exists("/history.json")) SPIFFS.remove("/history.json"); return; }
-    File file = SPIFFS.open("/history.json", "w"); if (!file) { Serial.println("SPIFFS: Open fail (w)."); return; }
-    size_t written = serializeJson(doc, file); file.close();
-    if (written == 0 && array.size() > 0) Serial.println("SPIFFS: Write fail (0 bytes).");
+
+    if (validRecs == 0) { // No valid records to save
+        if (SPIFFS.exists("/history.json")) SPIFFS.remove("/history.json");
+        // Serial.println("SPIFFS: No valid history records to save.");
+        return;
+    }
+
+    // Handle circular buffer saving correctly
+    // Start from the oldest record up to the newest
+    int startIdx = historyIndex; // current historyIndex is the next slot to be written (empty or oldest)
+    if (validRecs < MAX_HISTORY_RECORDS) { // Buffer not full yet, records are 0 to historyIndex-1
+        startIdx = 0;
+    }
+
+    for (int i = 0; i < validRecs; i++) {
+        int rIdx = (startIdx + i) % MAX_HISTORY_RECORDS;
+        if (drinkingHistory[rIdx].timestamp > 0 && year(drinkingHistory[rIdx].timestamp + gmtOffset_sec) > 2023) {
+            JsonObject obj = array.createNestedObject();
+            obj["petName"] = drinkingHistory[rIdx].petName;
+            obj["duration"] = drinkingHistory[rIdx].duration;
+            obj["timestamp"] = drinkingHistory[rIdx].timestamp;
+        }
+    }
+
+    if (array.size() == 0) { // Double check if array is empty after processing
+        if (SPIFFS.exists("/history.json")) SPIFFS.remove("/history.json");
+        return;
+    }
+
+    File file = SPIFFS.open("/history.json", "w");
+    if (!file) { Serial.println("SPIFFS: Open history.json fail (w)."); return; }
+    size_t written = serializeJson(doc, file);
+    file.close();
+    if (written == 0 && array.size() > 0) Serial.println("SPIFFS: Write history.json fail (0 bytes).");
     else if (array.size() > 0) Serial.println("SPIFFS: " + String(written) + " bytes saved to history.json");
 }
 
-void loadHistoryFromSPIFFS() { /* ... เหมือนเดิม ... */ 
-    for(int i=0; i<MAX_HISTORY_RECORDS; ++i) drinkingHistory[i].timestamp = 0; historyIndex = 0;
+void loadHistoryFromSPIFFS() {
+    for(int i=0; i<MAX_HISTORY_RECORDS; ++i) drinkingHistory[i].timestamp = 0; // Clear in-memory history first
+    historyIndex = 0;
+
     if (!SPIFFS.exists("/history.json")) { Serial.println("SPIFFS: History file not found."); return; }
-    File file = SPIFFS.open("/history.json", "r"); if (!file) { Serial.println("SPIFFS: Open fail (r)."); return; }
+    File file = SPIFFS.open("/history.json", "r");
+    if (!file) { Serial.println("SPIFFS: Open history.json fail (r)."); return; }
     if (file.size() == 0) { Serial.println("SPIFFS: History file empty."); file.close(); return; }
-    DynamicJsonDocument doc(16384); DeserializationError err = deserializeJson(doc, file); file.close();
-    if (err) { Serial.print("SPIFFS: Parse fail: "); Serial.println(err.c_str()); return; }
+
+    DynamicJsonDocument doc(16384); // Must be same or larger than saving
+    DeserializationError err = deserializeJson(doc, file);
+    file.close();
+    if (err) { Serial.print("SPIFFS: Parse history.json fail: "); Serial.println(err.c_str()); return; }
+
     JsonArray array = doc.as<JsonArray>();
     for (JsonObject obj : array) {
-        time_t ts = obj["timestamp"].as<time_t>(); if (year(ts + gmtOffset_sec) < 2024) continue;
+        time_t ts = obj["timestamp"].as<time_t>();
+        if (year(ts + gmtOffset_sec) < 2024) continue; // Skip old/invalid records
+
         if (historyIndex < MAX_HISTORY_RECORDS) {
             drinkingHistory[historyIndex].petName = obj["petName"].as<String>();
             drinkingHistory[historyIndex].duration = obj["duration"].as<float>();
-            drinkingHistory[historyIndex].timestamp = ts; historyIndex++;
-        } else { Serial.println("SPIFFS: History > MAX_RECORDS."); break; }
+            drinkingHistory[historyIndex].timestamp = ts;
+            historyIndex++;
+        } else {
+            Serial.println("SPIFFS: Loaded history exceeds MAX_HISTORY_RECORDS. Some records may be lost.");
+            break;
+        }
     }
     Serial.println("SPIFFS: History loaded. Records: " + String(historyIndex));
 }
 
-void saveSettings() { /* ... เหมือนเดิม ... */ 
-    DynamicJsonDocument doc(4096);
-    doc["rssi_threshold"] = RSSI_ENTER_THRESHOLD; doc["system_mode"] = systemMode; doc["pir_sensitivity"] = pirSensitivity;
-    doc["pir_enabled"] = pirEnabled; doc["pir_debounce_ms"] = PIR_DEBOUNCE_MS; doc["pir_max_gap_ms"] = PIR_MAX_GAP_MS;
+void saveSettings() {
+    DynamicJsonDocument doc(4096); // Sufficient for settings
+    doc["rssi_threshold"] = RSSI_ENTER_THRESHOLD;
+    doc["system_mode"] = systemMode;
+    doc["pir_sensitivity"] = pirSensitivity;
+    doc["pir_enabled"] = pirEnabled; // Save pirEnabled state
+    doc["pir_debounce_ms"] = PIR_DEBOUNCE_MS;
+    doc["pir_max_gap_ms"] = PIR_MAX_GAP_MS;
+
     JsonArray petsArray = doc.createNestedArray("pets");
     for (int i = 0; i < 3; i++) {
         JsonObject petObj = petsArray.createNestedObject();
-        petObj["name"] = pets[i].name; // เก็บชื่อภาษาไทยใน settings
-        petObj["name_en"] = pets[i].name_en; // เก็บชื่อภาษาอังกฤษด้วย
+        // petObj["name"] = pets[i].name; // Thai name, const char* so no need to save if not changing
+        // petObj["name_en"] = pets[i].name_en; // English name, also const char*
         petObj["count"] = pets[i].drinkingCount;
-        petObj["last_time"] = pets[i].lastDrinkTimeStr; petObj["last_date"] = pets[i].lastDrinkDateStr;
+        petObj["last_time"] = pets[i].lastDrinkTimeStr;
+        petObj["last_date"] = pets[i].lastDrinkDateStr;
     }
-    File file = SPIFFS.open("/settings.json", "w"); if (!file) { Serial.println("SPIFFS: Could not open settings file for writing"); return; }
-    size_t written = serializeJson(doc, file); file.close();
+
+    File file = SPIFFS.open("/settings.json", "w");
+    if (!file) { Serial.println("SPIFFS: Could not open settings file for writing"); return; }
+    size_t written = serializeJson(doc, file);
+    file.close();
     if (written > 0) Serial.println("SPIFFS: Settings saved successfully (" + String(written) + " bytes)");
     else Serial.println("SPIFFS: Failed to write settings");
+    settingsChanged = false; // Reset flag after saving
 }
 
 void loadSettings() {
     if (!SPIFFS.exists("/settings.json")) { Serial.println("SPIFFS: Settings file not found. Using defaults."); return; }
-    File file = SPIFFS.open("/settings.json", "r"); if (!file) { Serial.println("SPIFFS: Failed to open settings file"); return; }
-    DynamicJsonDocument doc(4096); DeserializationError error = deserializeJson(doc, file); file.close();
+    File file = SPIFFS.open("/settings.json", "r");
+    if (!file) { Serial.println("SPIFFS: Failed to open settings file"); return; }
+
+    DynamicJsonDocument doc(4096);
+    DeserializationError error = deserializeJson(doc, file);
+    file.close();
     if (error) { Serial.print("SPIFFS: Failed to parse settings: "); Serial.println(error.c_str()); return; }
-    RSSI_ENTER_THRESHOLD = doc["rssi_threshold"] | RSSI_ENTER_THRESHOLD; systemMode = doc["system_mode"] | 2;
-    pirSensitivity = doc["pir_sensitivity"] | 3; pirEnabled = doc["pir_enabled"] | true;
-    PIR_DEBOUNCE_MS = doc["pir_debounce_ms"] | 500; PIR_MAX_GAP_MS = doc["pir_max_gap_ms"] | 5000;
+
+    RSSI_ENTER_THRESHOLD = doc["rssi_threshold"] | RSSI_ENTER_THRESHOLD;
+    systemMode = doc["system_mode"] | 2; // Default to BLE+PIR
+    pirSensitivity = doc["pir_sensitivity"] | 3;
+    pirEnabled = doc["pir_enabled"] | true; // Load pirEnabled state
+    PIR_DEBOUNCE_MS = doc["pir_debounce_ms"] | 500;
+    PIR_MAX_GAP_MS = doc["pir_max_gap_ms"] | 5000;
+
+
     if (doc.containsKey("pets")) {
-        JsonArray petsArray = doc["pets"]; int i = 0;
+        JsonArray petsArray = doc["pets"];
+        int i = 0;
         for (JsonObject petObj : petsArray) {
             if (i < 3) {
-                // pets[i].name ไม่ต้องโหลด เพราะเป็น const char* ที่กำหนดตอน compile
-                // pets[i].name_en ก็เช่นกัน
+                // pets[i].name and pets[i].name_en are const char* and set at compile time.
+                // We load dynamic data like counts and last drink times.
                 pets[i].drinkingCount = petObj["count"] | 0;
                 pets[i].lastDrinkTimeStr = petObj["last_time"] | "--:--";
-                pets[i].lastDrinkDateStr = petObj["last_date"] | "--/--/----"; i++;
+                pets[i].lastDrinkDateStr = petObj["last_date"] | "--/--/----";
+                i++;
             }
         }
     }
     Serial.println("SPIFFS: Settings loaded successfully");
+    // Print loaded settings for confirmation
     Serial.println("System Mode: " + String(systemMode == 0 ? "BLE Only" : (systemMode == 1 ? "PIR Only" : "BLE+PIR")));
     Serial.println("RSSI Enter Threshold: " + String(RSSI_ENTER_THRESHOLD));
-    Serial.println("RSSI Strong Threshold: " + String(RSSI_STRONG_SIGNAL_THRESHOLD));
-    Serial.println("PIR Config: Sensitivity=" + String(pirSensitivity) + " Debounce=" + String(PIR_DEBOUNCE_MS) + "ms MaxGap=" + String(PIR_MAX_GAP_MS) + "ms");
+    Serial.println("PIR Config: Sensitivity=" + String(pirSensitivity) + " Debounce=" + String(PIR_DEBOUNCE_MS) + "ms MaxGap=" + String(PIR_MAX_GAP_MS) + "ms Enabled=" + String(pirEnabled));
 }
 
-void connectWiFi() { /* ... เหมือนเดิม ... */ 
+void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) { wifiConnected = true; return; }
     Serial.print("WiFi: Connecting to ["); Serial.print(ssid); Serial.print("]...");
-    WiFi.mode(WIFI_STA); WiFi.begin(ssid, password); int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
-    if (WiFi.status() == WL_CONNECTED) { Serial.println("\nWiFi: Connected. IP: " + WiFi.localIP().toString()); wifiConnected = true; }
-    else { Serial.println("\nWiFi: Connection Failed."); wifiConnected = false; }
-}
-
-void connectBlynk() { /* ... เหมือนเดิม ... */ 
-    if (!wifiConnected) { Serial.println("Blynk: WiFi not connected."); blynkConnected = false; return; }
-    Serial.print("Blynk: Connecting to server...");
-    Blynk.config(auth); 
-    if (Blynk.connect(5000)) { 
-        Serial.println("\nBlynk: Connected."); blynkConnected = true;
-        syncAllDataToBlynk(); 
+    WiFi.mode(WIFI_STA); WiFi.begin(ssid, password);
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) { // Try for 10 seconds
+        delay(500); Serial.print("."); attempts++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi: Connected. IP: " + WiFi.localIP().toString());
+        wifiConnected = true;
     } else {
-        Serial.println("\nBlynk: Connection Failed (timeout)."); blynkConnected = false;
+        Serial.println("\nWiFi: Connection Failed.");
+        wifiConnected = false;
     }
 }
 
-void checkConnections() { /* ... เหมือนเดิม ... */ 
+void connectBlynk() {
+    if (!wifiConnected) { Serial.println("Blynk: WiFi not connected. Cannot connect Blynk."); blynkConnected = false; return; }
+    Serial.print("Blynk: Connecting to server...");
+    Blynk.config(auth); // Configure Blynk auth token
+    if (Blynk.connect(5000)) { // Try to connect for 5 seconds
+        Serial.println("\nBlynk: Connected.");
+        blynkConnected = true;
+        syncAllDataToBlynk(); // Sync data on new connection
+    } else {
+        Serial.println("\nBlynk: Connection Failed (timeout).");
+        blynkConnected = false;
+    }
+}
+
+void checkConnections() {
     unsigned long currentMillis = millis();
     if (currentMillis - lastReconnectAttempt >= RECONNECT_INTERVAL) {
         lastReconnectAttempt = currentMillis;
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("SYS: WiFi disconnected. Reconnecting...");
-            wifiConnected = false; blynkConnected = false; 
+            wifiConnected = false; blynkConnected = false; // Assume Blynk also disconnected
             connectWiFi();
-            if (wifiConnected) {
-                initNTP(); 
-                connectBlynk();
+            if (wifiConnected) { // If WiFi reconnected
+                initNTP(); // Re-initialize NTP if needed
+                connectBlynk(); // Try to reconnect Blynk
             }
-        } else { 
+        } else { // WiFi is connected
             wifiConnected = true;
-            if (!Blynk.connected()) {
+            if (!Blynk.connected()) { // Check Blynk connection
                 Serial.println("SYS: Blynk disconnected (WiFi OK). Reconnecting Blynk...");
-                connectBlynk(); 
+                connectBlynk(); // Try to reconnect Blynk
             } else {
                 blynkConnected = true;
             }
@@ -1068,53 +1258,76 @@ void checkConnections() { /* ... เหมือนเดิม ... */
     }
 }
 
-BLYNK_CONNECTED() { /* ... เหมือนเดิม ... */ 
+BLYNK_CONNECTED() {
     Serial.println("Blynk: Connected (event handler). Syncing data.");
     blynkConnected = true;
     syncAllDataToBlynk();
 }
 
-BLYNK_WRITE(VPIN_RESET_ALL) { /* ... เหมือนเดิม ... */ 
+BLYNK_WRITE(VPIN_RESET_ALL) {
     if (param.asInt() == 1) {
         Serial.println("Blynk V8: Reset All initiated...");
+        // Reset pet states
         for(int i=0; i<3; ++i) {
-            pets[i].drinkingCount = 0; pets[i].presenceConfirmCount = 0; pets[i].isNearby = false;
-            pets[i].dataSent = true; pets[i].lastDrinkTimeStr = "--:--"; pets[i].lastDrinkDateStr = "--/--/----";
-            pets[i].consecutiveMissCount = 0; pets[i].pirDetected = false; pets[i].lastPirDetectionTime = 0;
+            pets[i].drinkingCount = 0;
+            pets[i].presenceConfirmCount = 0;
+            pets[i].isNearby = false;
+            pets[i].dataSent = true;
+            pets[i].lastDrinkTimeStr = "--:--";
+            pets[i].lastDrinkDateStr = "--/--/----";
+            pets[i].consecutiveMissCount = 0;
+            pets[i].pirDetected = false;
+            pets[i].lastPirDetectionTime = 0;
+             // Reset RSSI buffer
+            for(int j=0; j<10; ++j) pets[i].rssiBuffer[j] = -100;
+            pets[i].filteredRSSI = -100.0f;
         }
-        activePetIndex = -1;
-        for (int i = 0; i < MAX_HISTORY_RECORDS; i++) { drinkingHistory[i].timestamp = 0; } 
-        historyIndex = 0; Serial.println("SYS: In-memory history cleared.");
+        activePetIndex = -1; // Reset active pet
+
+        // Clear in-memory history
+        for (int i = 0; i < MAX_HISTORY_RECORDS; i++) { drinkingHistory[i].timestamp = 0; }
+        historyIndex = 0;
+        Serial.println("SYS: In-memory history cleared.");
+
+        // Delete history file from SPIFFS
         if (SPIFFS.exists("/history.json")) {
             if (SPIFFS.remove("/history.json")) Serial.println("SPIFFS: History file deleted.");
             else Serial.println("SPIFFS: Failed to delete history file.");
         } else Serial.println("SPIFFS: No history file to delete.");
-        settingsChanged = true; saveSettings(); 
-        syncAllDataToBlynk();
-        Blynk.virtualWrite(VPIN_RESET_ALL, 0); 
+
+        settingsChanged = true; // Mark settings changed to save the new zeroed counts
+        saveSettings(); // Save the reset settings (especially pet counts)
+
+        syncAllDataToBlynk(); // Send reset data to Blynk
+        Blynk.virtualWrite(VPIN_RESET_ALL, 0); // Reset the button in Blynk app
         Serial.println("SYS: All data reset completed.");
     }
 }
 
-BLYNK_WRITE(VPIN_RSSI_THRESHOLD_SLIDER) { /* ... เหมือนเดิม ... */ 
+BLYNK_WRITE(VPIN_RSSI_THRESHOLD_SLIDER) {
     RSSI_ENTER_THRESHOLD = param.asInt();
     Serial.print("Blynk V10: RSSI Enter Threshold set to: "); Serial.println(RSSI_ENTER_THRESHOLD);
     settingsChanged = true;
 }
 
-BLYNK_WRITE(VPIN_PIR_SENSITIVITY) { /* ... เหมือนเดิม ... */ 
+BLYNK_WRITE(VPIN_PIR_SENSITIVITY) {
     pirSensitivity = param.asInt();
-    if (pirSensitivity < 1) pirSensitivity = 1; if (pirSensitivity > 5) pirSensitivity = 5;
-    Serial.print("Blynk V18: PIR Sensitivity set to: "); Serial.println(pirSensitivity);
+    if (pirSensitivity < 1) pirSensitivity = 1;
+    if (pirSensitivity > 5) pirSensitivity = 5;
+    Serial.print("Blynk V18: PIR Sensitivity (logical) set to: "); Serial.println(pirSensitivity);
+    // Adjust PIR_DEBOUNCE_MS based on sensitivity
     switch (pirSensitivity) {
-        case 1: PIR_DEBOUNCE_MS = 1000; break; case 2: PIR_DEBOUNCE_MS = 800; break;
-        case 3: PIR_DEBOUNCE_MS = 500; break; case 4: PIR_DEBOUNCE_MS = 300; break;
-        case 5: PIR_DEBOUNCE_MS = 100; break;
+        case 1: PIR_DEBOUNCE_MS = 1000; break; // Lowest sensitivity, longest debounce
+        case 2: PIR_DEBOUNCE_MS = 800;  break;
+        case 3: PIR_DEBOUNCE_MS = 500;  break; // Default
+        case 4: PIR_DEBOUNCE_MS = 300;  break;
+        case 5: PIR_DEBOUNCE_MS = 100;  break; // Highest sensitivity, shortest debounce
     }
+    Serial.println("PIR Debounce Time updated to: " + String(PIR_DEBOUNCE_MS) + "ms");
     settingsChanged = true;
 }
 
-BLYNK_WRITE(VPIN_SYSTEM_MODE) { /* ... เหมือนเดิม ... */ 
+BLYNK_WRITE(VPIN_SYSTEM_MODE) {
     int newMode = param.asInt();
     if (newMode >= 0 && newMode <= 2 && newMode != systemMode) {
         systemMode = newMode;
@@ -1125,11 +1338,18 @@ BLYNK_WRITE(VPIN_SYSTEM_MODE) { /* ... เหมือนเดิม ... */
             case 2: Serial.println("BLE+PIR"); pirEnabled = true; break;
         }
         settingsChanged = true;
+        // If a pet was active, reset its state due to mode change
         if (activePetIndex != -1) {
-             pets[activePetIndex].isNearby = false; pets[activePetIndex].presenceConfirmCount = 0; 
-             pets[activePetIndex].dataSent = true; pets[activePetIndex].consecutiveMissCount = 0;
+             pets[activePetIndex].isNearby = false;
+             pets[activePetIndex].presenceConfirmCount = 0;
+             pets[activePetIndex].dataSent = true;
+             pets[activePetIndex].consecutiveMissCount = 0;
+             pets[activePetIndex].pirDetected = false; // Reset PIR detection for the pet
              activePetIndex = -1;
+             lastSessionEndTime = millis(); // Update last session end time
              Serial.println("System Mode Changed: Active pet session reset.");
         }
+        // Reset general PIR triggered flag as well, it will be re-evaluated by processPirState
+        pirTriggered = false;
     }
 }
