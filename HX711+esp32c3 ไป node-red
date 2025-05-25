@@ -1,0 +1,315 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h> // หรือ WiFiClient ถ้า MQTT broker ไม่ใช้ SSL
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <HX711.h>
+#include <time.h>
+
+// --- ตั้งค่า Wi-Fi ---
+const char* ssid = "room5/26_2.4G";
+const char* password = "top140635";
+
+// --- ตั้งค่า MQTT ---
+const char* mqtt_server = "h970e2d4.ala.asia-southeast1.emqxsl.com"; // MQTT Broker ของคุณ
+const int mqtt_port = 8883; // 8883 สำหรับ SSL/TLS, 1883 สำหรับ non-SSL
+const char* mqtt_username = "neungburud"; // Username MQTT ของคุณ (ถ้ามี)
+const char* mqtt_password = "@Top140635"; // Password MQTT ของคุณ (ถ้ามี)
+String deviceId;
+
+// --- หัวข้อ MQTT ---
+const char* topic_water_weight_publish = "pet/water_station/weight";   // Topic สำหรับส่งข้อมูลน้ำหนัก
+const char* topic_water_command_subscribe = "pet/water_station/command"; // Topic สำหรับรับคำสั่ง (เช่น tare)
+const char* topic_water_status_publish = "pet/water_station/status";   // Topic สำหรับส่งสถานะ (เช่น tare_complete)
+
+// --- ตั้งค่า HX711 ---
+const int LOADCELL_DOUT_PIN = 2; // GPIO2
+const int LOADCELL_SCK_PIN = 3;  // GPIO3
+HX711 scale;
+float calibration_factor = -369.726624; // << *** แก้ไขเป็นค่า Calibration Factor ของคุณ ***
+                                   // (ค่านี้มักจะเป็นลบถ้าอ่านค่าเพิ่มเมื่อน้ำหนักกดลง และคุณต้องการค่าบวก)
+                                   // หรือเป็นบวก ขึ้นอยู่กับการต่อ load cell และการคำนวณของคุณ
+
+// --- Clients และ Objects ---
+WiFiClientSecure espClient; // ใช้ WiFiClient ถ้า MQTT Broker ไม่ใช้ SSL
+PubSubClient client(espClient);
+
+// --- ตัวแปร Global อื่นๆ ---
+unsigned long lastPublishTime = 0;
+const long publishInterval = 5000; // ส่งข้อมูลทุก 5 วินาที (5000 ms)
+
+unsigned long lastReconnectAttemptMQTT = 0;
+unsigned long lastReconnectAttemptWiFi = 0;
+const int reconnectInterval = 5000; // ms
+
+volatile bool requestTare = false; // Flag สำหรับสั่ง Tare
+
+// --- Prototype ฟังก์ชัน ---
+void connectWiFi();
+void setupNTP();
+unsigned long getUnixTimestamp();
+void setupMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+bool connectMQTT();
+void publishWeightData(float weight);
+void publishStatusMessage(const char* status_msg, const char* reason_msg);
+
+void setup() {
+    Serial.begin(115200);
+    while (!Serial) { delay(10); } // รอ Serial เปิด
+    Serial.println("\n\nESP32-C3 HX711 Water Monitor with MQTT Tare");
+
+    // สร้าง Device ID จาก MAC Address (ไม่ซ้ำกันสำหรับแต่ละ ESP)
+    uint64_t chipid = ESP.getEfuseMac();
+    deviceId = "ESP32C3-HX711-" + String((uint16_t)(chipid >> 32), HEX) + String((uint32_t)chipid, HEX);
+    deviceId.toUpperCase();
+    Serial.print("Device ID: ");
+    Serial.println(deviceId);
+
+    connectWiFi(); // เชื่อมต่อ WiFi
+
+    if (WiFi.status() == WL_CONNECTED) {
+        setupNTP();    // ตั้งค่า NTP หลังจากเชื่อมต่อ WiFi
+        setupMQTT();   // ตั้งค่า MQTT client
+    }
+
+    Serial.println("Initializing the scale...");
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    scale.set_scale(calibration_factor);
+    scale.tare(); // Tare ครั้งแรกเมื่อเริ่มต้น
+    Serial.println("Scale initialized and tared.");
+    long zero_factor = scale.read_average(); // อ่านค่า offset หลังจาก tare
+    Serial.print("Zero factor: "); Serial.println(zero_factor);
+}
+
+void loop() {
+    if (WiFi.status() != WL_CONNECTED) {
+        unsigned long now = millis();
+        if (now - lastReconnectAttemptWiFi > reconnectInterval) {
+            lastReconnectAttemptWiFi = now;
+            Serial.println("Reconnecting to WiFi...");
+            connectWiFi();
+            if (WiFi.status() == WL_CONNECTED && !client.connected()) { // ถ้า WiFi ต่อได้แล้วแต่ MQTT ยังไม่ต่อ
+                lastReconnectAttemptMQTT = 0; // Reset timer MQTT เพื่อให้พยายามต่อทันที
+            }
+        }
+        delay(100); // รอสักครู่ก่อนลองใหม่
+        return; // ออกจาก loop ถ้า WiFi ยังไม่เชื่อมต่อ
+    }
+
+    if (!client.connected()) {
+        connectMQTT(); // ถ้า MQTT หลุด ให้พยายามเชื่อมต่อใหม่
+    }
+    client.loop(); // ให้ PubSubClient ทำงาน (สำคัญมากสำหรับการรับ-ส่งข้อมูล)
+
+    // ตรวจสอบถ้ามีการร้องขอ Tare
+    if (requestTare) {
+        Serial.println("Performing tare operation based on MQTT command...");
+        scale.tare();
+        Serial.println("Scale tared.");
+        publishStatusMessage("tare_complete", "mqtt_command");
+        requestTare = false; // เคลียร์ flag
+    }
+
+    // ส่งข้อมูลน้ำหนักตามช่วงเวลาที่กำหนด
+    unsigned long currentTime = millis();
+    if (currentTime - lastPublishTime >= publishInterval) {
+        lastPublishTime = currentTime;
+
+        if (scale.is_ready()) {
+            float weight = scale.get_units(5); // อ่านค่าน้ำหนัก (เฉลี่ย 5 ครั้ง)
+            // ปรับค่าที่ได้ถ้าต้องการ เช่น บางครั้งอาจมีค่าติดลบน้อยๆ หลัง tare
+            if (abs(weight) < 0.05) { // ถ้าค่าน้อยมากๆ ให้ถือเป็น 0 (ปรับ threshold ตามต้องการ)
+                 weight = 0.0;
+            }
+            Serial.print(millis()); Serial.print(" - Weight: "); Serial.print(weight, 2); Serial.println(" g");
+            publishWeightData(weight);
+        } else {
+            Serial.println("Scale not ready.");
+        }
+    }
+}
+
+void connectWiFi() {
+    Serial.print("Connecting to WiFi: ");
+    Serial.println(ssid);
+    WiFi.disconnect(true, true); // Disconnect and erase WiFi config in RAM
+    delay(100);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 30) { // เพิ่ม attempts หรือ timeout
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi Connected!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+        lastReconnectAttemptWiFi = millis(); // Reset reconnect timer
+    } else {
+        Serial.println("\nWiFi Connection Failed. Will retry...");
+    }
+}
+
+void setupNTP() {
+    Serial.print("Configuring NTP... ");
+    // ตั้งค่า server NTP, timezone (GMT+7 = 7*3600), และ daylight saving (0 for Thailand)
+    configTime(7 * 3600, 0, "pool.ntp.org", "time.google.com", "time.windows.com");
+
+    Serial.print("Waiting for NTP time sync: ");
+    time_t now = time(nullptr);
+    int ntp_attempts = 0;
+    while (now < 8 * 3600 * 2 && ntp_attempts < 30) { // รอจนกว่าเวลาจะถูกต้อง หรือหมดเวลาพยายาม
+        delay(500);
+        Serial.print(".");
+        now = time(nullptr);
+        ntp_attempts++;
+    }
+    Serial.println();
+
+    if (now < 8 * 3600 * 2) {
+        Serial.println("NTP Time sync failed or timed out.");
+    } else {
+        struct tm timeinfo;
+        getLocalTime(&timeinfo);
+        Serial.print("NTP Time synced. Current time: ");
+        Serial.println(asctime(&timeinfo));
+    }
+}
+
+unsigned long getUnixTimestamp() {
+    time_t now;
+    time(&now);
+    if (now < 8 * 3600 * 2) { // ตรวจสอบว่า NTP sync หรือยัง (เป็นค่าประมาณ)
+        return 0; // คืนค่า 0 ถ้าเวลายังไม่ถูกต้อง
+    }
+    return now;
+}
+
+void setupMQTT() {
+    // สำหรับ EMQ X Cloud ที่ใช้ SSL/TLS port 8883 (หรือ Broker อื่นๆ ที่ใช้ SSL)
+    // ถ้า Broker ของคุณต้องการ Root CA Certificate, คุณต้องเพิ่มโค้ดนี้:
+    // espClient.setCACert(root_ca_char_array);
+    // หรือถ้า Broker ไม่ใช้ SSL/TLS (เช่น port 1883) ให้เปลี่ยน WiFiClientSecure เป็น WiFiClient
+    // และไม่ต้องใช้ espClient.setInsecure();
+    espClient.setInsecure(); // ***ข้อควรระวัง***: ข้ามการตรวจสอบ Certificate (ไม่ปลอดภัยสำหรับการใช้งานจริง)
+                             // ใช้สำหรับการทดสอบ หรือถ้าคุณมั่นใจในเครือข่ายของคุณ
+                             // สำหรับการใช้งานจริง ควรใช้ Certificate ที่ถูกต้อง
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(mqttCallback);
+    client.setBufferSize(512); // เพิ่ม Buffer Size เผื่อ JSON payload ยาว
+}
+
+void mqttCallback(char* topic, byte* recvdPayload, unsigned int length) {
+    Serial.print("Message arrived on topic: [");
+    Serial.print(topic);
+    Serial.print("]. Message: ");
+    char msgBuffer[length + 1];
+    memcpy(msgBuffer, recvdPayload, length);
+    msgBuffer[length] = '\0'; // Null terminate
+    Serial.println(msgBuffer);
+
+    if (strcmp(topic, topic_water_command_subscribe) == 0) {
+        StaticJsonDocument<128> doc; // JSON เล็กๆ สำหรับคำสั่ง
+        DeserializationError error = deserializeJson(doc, msgBuffer);
+
+        if (error) {
+            Serial.print(F("deserializeJson() failed: "));
+            Serial.println(error.f_str());
+            return;
+        }
+
+        const char* command = doc["command"]; // คาดหวัง payload เช่น {"command":"tare"}
+        if (command != nullptr && strcmp(command, "tare") == 0) {
+            Serial.println("Tare command received via MQTT.");
+            requestTare = true; // ตั้ง flag ให้ loop() ทำการ tare
+        } else {
+            Serial.println("Unknown command or invalid JSON format.");
+        }
+    }
+}
+
+bool connectMQTT() {
+    if (client.connected()) {
+        return true;
+    }
+    unsigned long now = millis();
+    if (now - lastReconnectAttemptMQTT > reconnectInterval) {
+        lastReconnectAttemptMQTT = now;
+        Serial.print("Attempting MQTT connection to ");
+        Serial.print(mqtt_server);
+        Serial.print(" with client ID: ");
+        Serial.println(deviceId);
+        Serial.print("Username: "); Serial.println(mqtt_username);
+
+
+        if (client.connect(deviceId.c_str(), mqtt_username, mqtt_password)) {
+            Serial.println("MQTT Connected!");
+            lastReconnectAttemptMQTT = millis(); // Reset timer
+            // Subscribe topic คำสั่งหลังจากเชื่อมต่อสำเร็จ
+            if(client.subscribe(topic_water_command_subscribe)){
+                Serial.print("Successfully subscribed to: ");
+                Serial.println(topic_water_command_subscribe);
+            } else {
+                Serial.print("Failed to subscribe to: ");
+                Serial.println(topic_water_command_subscribe);
+            }
+            // Publish สถานะ "online" เมื่อเชื่อมต่อสำเร็จ
+            publishStatusMessage("online", "boot_or_reconnect");
+            return true;
+        } else {
+            Serial.print("MQTT connection failed, rc=");
+            Serial.print(client.state());
+            Serial.println(". Will try again in 5 seconds.");
+            // ดู error code ของ PubSubClient:
+            // -4 : MQTT_CONNECT_FAILED
+            // -3 : MQTT_CONNECT_BAD_PROTOCOL
+            // -2 : MQTT_CONNECT_BAD_CLIENT_ID
+            // -1 : MQTT_CONNECT_UNAVAILABLE
+            return false;
+        }
+    }
+    return false;
+}
+
+void publishWeightData(float weight) {
+    if (!client.connected()) {
+        Serial.println("MQTT not connected. Cannot publish weight.");
+        return;
+    }
+
+    StaticJsonDocument<256> doc; // สร้าง JSON object
+    doc["device_id"] = deviceId;
+    doc["timestamp"] = getUnixTimestamp();
+    doc["weight_grams"] = serialized(String(weight, 2)); // ส่งเป็น String ที่มีทศนิยม 2 ตำแหน่ง
+
+    char jsonBuffer[256];
+    size_t n = serializeJson(doc, jsonBuffer);
+
+    if (client.publish(topic_water_weight_publish, jsonBuffer, n)) {
+        // Serial.print("Published to "); Serial.print(topic_water_weight_publish); Serial.print(": "); Serial.println(jsonBuffer);
+    } else {
+        Serial.println("MQTT Publish weight failed.");
+    }
+}
+
+void publishStatusMessage(const char* status_msg, const char* reason_msg) {
+    if (!client.connected()) {
+        // Serial.println("MQTT not connected. Cannot publish status.");
+        return;
+    }
+    StaticJsonDocument<200> doc;
+    doc["device_id"] = deviceId;
+    doc["timestamp"] = getUnixTimestamp();
+    doc["status"] = status_msg;
+    if (reason_msg != nullptr) {
+        doc["reason"] = reason_msg;
+    }
+
+    char jsonBuffer[200];
+    size_t n = serializeJson(doc, jsonBuffer);
+    client.publish(topic_water_status_publish, jsonBuffer, n);
+}
